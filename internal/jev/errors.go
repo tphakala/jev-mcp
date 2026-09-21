@@ -7,3 +7,8 @@ import "errors"
 // name (or a request-level detail) using %w, so callers match it with
 // errors.Is and still see the specifics in the message.
 var ErrValidation = errors.New("jev: invalid request")
+
+// ErrMalformedResponse is returned when a response cannot be decoded, for
+// example an answer whose value is not a JSON object. It is wrapped with %w, so
+// callers match it with errors.Is.
+var ErrMalformedResponse = errors.New("jev: malformed response")

@@ -10,7 +10,10 @@
 // against docs.typesafe.ai and the OpenRouter System One docs on 2026-09-21.
 package jev
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // QuestionType names one of Jev's three decision primitives.
 type QuestionType string
@@ -85,34 +88,68 @@ type Response struct {
 	Usage    Usage             `json:"usage"`
 }
 
-// UnmarshalJSON decodes a Response and preserves each answer's verbatim bytes
-// in [Answer.Raw], so an unknown field or an unrecognised answer type survives
-// a round trip. It decodes the payload twice: once with the default struct
-// decoding for the typed fields, once to capture the raw answer objects.
+// UnmarshalJSON decodes a Response, preserving each answer's verbatim bytes in
+// [Answer.Raw]. Answers are taken as raw JSON and decoded one at a time, so an
+// answer this codec cannot fully model (an unrecognised type, or a known field
+// carrying an unexpected shape) is kept in Raw rather than failing the whole
+// response. A non-object answer is still an error.
 func (r *Response) UnmarshalJSON(data []byte) error {
-	// wire has no methods, so json uses the default struct decoding instead of
-	// recursing into this method.
-	type wire Response
-	var w wire
-	if err := json.Unmarshal(data, &w); err != nil {
+	// The envelope fields are listed here and must match Response; the
+	// OpenRouter fixture exercises every one. Answers stay raw so a single
+	// unmodellable answer cannot fail the decode of the rest.
+	var env struct {
+		ID       string                     `json:"id,omitempty"`
+		Provider string                     `json:"provider,omitempty"`
+		Model    string                     `json:"model"`
+		Answers  map[string]json.RawMessage `json:"answers"`
+		Usage    Usage                      `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
 		return err
 	}
 
-	var rawAnswers struct {
-		Answers map[string]json.RawMessage `json:"answers"`
+	r.ID, r.Provider, r.Model, r.Usage = env.ID, env.Provider, env.Model, env.Usage
+	r.Answers = nil
+	if env.Answers == nil {
+		return nil
 	}
-	if err := json.Unmarshal(data, &rawAnswers); err != nil {
-		return err
+	r.Answers = make(map[string]Answer, len(env.Answers))
+	for name, raw := range env.Answers {
+		ans, err := decodeAnswer(raw)
+		if err != nil {
+			return fmt.Errorf("answer %q: %w", name, err)
+		}
+		r.Answers[name] = ans
 	}
-	for name, raw := range rawAnswers.Answers {
-		ans := w.Answers[name]
-		// raw is a map value decoded by encoding/json, which copies into fresh
-		// backing storage (RawMessage.UnmarshalJSON does append((*m)[:0], data)),
-		// so it already owns its bytes and never aliases data. No clone needed.
-		ans.Raw = raw
-		w.Answers[name] = ans
-	}
-
-	*r = Response(w)
 	return nil
+}
+
+// decodeAnswer decodes one answer, always preserving its verbatim bytes in Raw.
+// The typed fields are best effort: an object this codec cannot fully model (an
+// unrecognised type, or a known field with an unexpected shape) keeps its raw
+// form and recovers the type discriminator where it can, rather than failing. A
+// non-object answer is malformed and returns an error. raw is a map value that
+// encoding/json decoded into fresh storage, so it already owns its bytes and is
+// safe to keep without a clone.
+func decodeAnswer(raw json.RawMessage) (Answer, error) {
+	// Guard before decoding: json.Unmarshal accepts JSON null into a struct as a
+	// no-op (no error), so a null answer would slip past a post-decode check.
+	// Rejecting every non-object here keeps null, arrays, and scalars uniform.
+	if jsonKind(raw) != '{' {
+		return Answer{}, fmt.Errorf("%w: answer value is not a JSON object", ErrMalformedResponse)
+	}
+	var a Answer
+	if err := json.Unmarshal(raw, &a); err != nil {
+		// An object this codec cannot fully model (an unrecognised type, or a
+		// known field with an unexpected shape): keep it verbatim and recover
+		// the type discriminator where possible.
+		a = Answer{}
+		var typed struct {
+			Type QuestionType `json:"type"`
+		}
+		_ = json.Unmarshal(raw, &typed) // best effort; Type stays empty if it fails
+		a.Type = typed.Type
+	}
+	a.Raw = raw
+	return a, nil
 }

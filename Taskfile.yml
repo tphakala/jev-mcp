@@ -44,6 +44,7 @@ tasks:
     desc: Run the fuzz targets for a short bounded time each
     cmds:
       - go test -run='^$' -fuzz='^FuzzValidate$' -fuzztime={{.FUZZ_TIME}} ./internal/jev
+      - go test -run='^$' -fuzz='^FuzzResponseUnmarshal$' -fuzztime={{.FUZZ_TIME}} ./internal/jev
 
   vet:
     desc: Run go vet for amd64 and arm64, and compile the ruleguard matchers

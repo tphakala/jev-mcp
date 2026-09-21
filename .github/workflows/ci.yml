@@ -182,6 +182,8 @@ jobs:
       # a substitute for a long local fuzz session.
       - name: Fuzz validate
         run: go test -run='^$' -fuzz='^FuzzValidate$' -fuzztime=20s ./internal/jev
+      - name: Fuzz response unmarshal
+        run: go test -run='^$' -fuzz='^FuzzResponseUnmarshal$' -fuzztime=20s ./internal/jev
 
   goreleaser:
     name: GoReleaser config

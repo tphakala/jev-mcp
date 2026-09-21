@@ -2,6 +2,7 @@ package jev_test
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -189,6 +190,60 @@ func TestResponseDecodeMalformed(t *testing.T) {
 	}
 }
 
+func TestResponseDecodeToleratesUnmodellableAnswer(t *testing.T) {
+	t.Parallel()
+
+	// A future answer type that reuses a known field name with a different shape
+	// (here score as a string) must be preserved in Raw, not fail the response.
+	data := []byte(`{"model":"m","answers":{"q":{"type":"quantum","score":"high","note":"x"}},"usage":{"input_tokens":1,"output_tokens":1}}`)
+	var r jev.Response
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("decode should tolerate an unmodellable answer object, got %v", err)
+	}
+	a := r.Answers["q"]
+	if a.Type != "quantum" {
+		t.Errorf("Type = %q, want quantum", a.Type)
+	}
+	if a.Score != nil {
+		t.Errorf("Score = %v, want nil (the unmodellable field is left unset)", a.Score)
+	}
+	var probe struct {
+		Score string `json:"score"`
+	}
+	if err := json.Unmarshal(a.Raw, &probe); err != nil || probe.Score != "high" {
+		t.Errorf("Raw did not preserve the verbatim answer: raw=%s err=%v", a.Raw, err)
+	}
+}
+
+func TestResponseDecodeRejectsNonObjectAnswer(t *testing.T) {
+	t.Parallel()
+
+	// An answer value that is not a JSON object, including JSON null (which
+	// json.Unmarshal would otherwise accept into a struct as a no-op), is
+	// malformed and must fail the decode rather than be silently tolerated.
+	answers := map[string]string{
+		"null":   `null`,
+		"array":  `[1,2]`,
+		"string": `"hello"`,
+		"number": `123`,
+		"bool":   `true`,
+	}
+	for name, val := range answers {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			data := []byte(`{"model":"m","answers":{"q":` + val + `},"usage":{}}`)
+			var r jev.Response
+			err := json.Unmarshal(data, &r)
+			if err == nil {
+				t.Fatalf("a %s answer should fail to decode", name)
+			}
+			if !errors.Is(err, jev.ErrMalformedResponse) {
+				t.Errorf("error %v does not wrap ErrMalformedResponse", err)
+			}
+		})
+	}
+}
+
 // FuzzResponseUnmarshal pins the decoder's reason to exist: every answer that
 // decodes must carry a non-empty, valid-JSON Raw whose own "type" matches the
 // typed Answer.Type. A regression in the raw-capture loop (an empty Raw, a Raw
@@ -216,14 +271,18 @@ func FuzzResponseUnmarshal(f *testing.F) {
 			if !json.Valid(a.Raw) {
 				t.Fatalf("answer %q Raw is not valid JSON: %s", name, a.Raw)
 			}
-			var probe struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(a.Raw, &probe); err != nil {
-				t.Fatalf("answer %q Raw does not re-decode: %v", name, err)
-			}
-			if probe.Type != string(a.Type) {
-				t.Fatalf("answer %q Raw type %q != Answer.Type %q", name, probe.Type, a.Type)
+			// When a type discriminator was recovered, Raw must be the object
+			// that carried it: guards against a Raw taken from the wrong answer.
+			if a.Type != "" {
+				// a.Type was decoded from a.Raw as a string, so re-decoding it
+				// must succeed; an error here means Raw was captured from a
+				// different answer whose type is not a string.
+				var probe struct {
+					Type jev.QuestionType `json:"type"`
+				}
+				if err := json.Unmarshal(a.Raw, &probe); err != nil || probe.Type != a.Type {
+					t.Fatalf("answer %q Raw type %q != Answer.Type %q (err %v)", name, probe.Type, a.Type, err)
+				}
 			}
 		}
 	})
