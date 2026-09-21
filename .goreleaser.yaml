@@ -1,0 +1,64 @@
+# GoReleaser configuration. Validated in CI by `goreleaser check`; exercised
+# locally with `task snapshot`, which builds every target without publishing.
+# The Release workflow runs `goreleaser release` on a v* tag after the version
+# guard has confirmed the Version constant matches the tag.
+version: 2
+
+project_name: jev-mcp
+
+before:
+  hooks:
+    - go mod tidy -diff
+
+builds:
+  - id: jev-mcp
+    main: ./cmd/jev-mcp
+    binary: jev-mcp
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Reproducible builds: stamp the binary with the commit time, not the
+    # build time.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # GitHub's generated notes (the same text `gh release create
+  # --generate-notes` produces), so the release notes follow the repository's
+  # release.yml categories if one is added later.
+  use: github-native
+
+release:
+  # Draft so the notes can be edited before publishing.
+  draft: true
+  # A tag with a pre-release suffix (v1.2.0-rc.1) is flagged as a pre-release
+  # so it never becomes the repository's "Latest release".
+  prerelease: auto

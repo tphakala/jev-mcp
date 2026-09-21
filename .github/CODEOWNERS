@@ -1,0 +1,3 @@
+# Default owner for everything in the repository; more specific paths below
+# override it for their subtree.
+* @tphakala

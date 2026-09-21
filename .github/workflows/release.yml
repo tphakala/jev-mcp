@@ -1,0 +1,77 @@
+name: Release
+
+# Runs on every v* tag push. The verify job is the guard against cutting a tag
+# while the Version constant still says something else: TestVersionMatchesReleaseTag
+# fails unless "v"+Version equals the tag, and the release job depends on it,
+# so a mismatched tag yields a red workflow and no release instead of a wrong
+# one. Recovery: delete the tag, cut it again with `task release VERSION=x.y.z`
+# (scripts/release.sh, which bumps and verifies), and push.
+#
+# Actions in the release job are pinned by commit SHA (with the version in a
+# comment, which Dependabot keeps updated) because that job holds contents:
+# write; a moving tag on a third-party action would be a supply-chain risk.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Version matches the tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # scripts/verify-version.sh owns the RELEASE_TAG wiring, the PASS-line
+      # check (a SKIP or a renamed test must not pass), and the tee log
+      # location ($RUNNER_TEMP, outside the workspace). scripts/release.sh
+      # calls the same script before tagging, so the pre-tag and post-tag
+      # checks cannot drift.
+      - name: Check the version constant against the tag
+        # Pass the tag through an env var, not a ${{ }} interpolation inside
+        # run:. github.ref_name is expanded into the script before the shell
+        # parses it, so a tag name carrying shell metacharacters would inject
+        # commands; the env indirection makes the shell see it as data.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/verify-version.sh "$TAG"
+      # A tag can be pushed from a commit that never went through a pull
+      # request, so the suite runs here too rather than trusting main's CI.
+      - name: Test
+        run: go test -race -shuffle=on ./...
+
+  release:
+    name: Build and publish the draft release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # GoReleaser reads the tag history for the version and the changelog
+          # range.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

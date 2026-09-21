@@ -1,0 +1,14 @@
+# Keep the build context to what the Go build needs.
+.git
+.github
+dist
+coverage.out
+*.out
+*.test
+*.md
+!README.md
+docs
+.claude
+.serena
+.codegraph
+CLAUDE.local.md
