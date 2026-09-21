@@ -26,9 +26,10 @@ var (
 	// missing, wrong, or lacks access.
 	ErrUnauthorized = errors.New("jev: unauthorized")
 
-	// ErrInvalidRequest is the sentinel for a request the server rejects (400,
-	// 413, 422). The same request will fail on every provider, so the client
-	// does not fall back on it.
+	// ErrInvalidRequest is the sentinel for a request the server rejects: 400,
+	// 413, and 422, and any other client-side (sub-500) status that has no more
+	// specific sentinel, for example 404. The same request will fail on every
+	// provider, so the client does not fall back on it.
 	ErrInvalidRequest = errors.New("jev: request rejected")
 
 	// ErrRateLimited is the sentinel for HTTP 429.
