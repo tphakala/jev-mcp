@@ -6,6 +6,7 @@ vars:
   GOLANGCI_LINT_VERSION:
     sh: tr -d '[:space:]' < .golangci-version
   BENCH_TIME: 2s
+  FUZZ_TIME: 20s
 
 tasks:
   default:
@@ -38,6 +39,12 @@ tasks:
     desc: Run all benchmarks
     cmds:
       - go test -run='^$' -bench=. -benchmem -benchtime={{.BENCH_TIME}} ./...
+
+  fuzz:
+    desc: Run the fuzz targets for a short bounded time each
+    cmds:
+      - go test -run='^$' -fuzz='^FuzzValidate$' -fuzztime={{.FUZZ_TIME}} ./internal/jev
+      - go test -run='^$' -fuzz='^FuzzResponseUnmarshal$' -fuzztime={{.FUZZ_TIME}} ./internal/jev
 
   vet:
     desc: Run go vet for amd64 and arm64, and compile the ruleguard matchers

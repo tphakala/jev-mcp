@@ -1,0 +1,17 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "severity": {
+      "type": "score",
+      "score": 0.9,
+      "probabilities": {"0": 0.4, "1": 0.5, "2": 0.1},
+      "legend": {
+        "0": {"what": "Cosmetic; no impact to functionality", "examples": ["typo in a label"]},
+        "1": {"what": "Broken or degraded feature, but a workaround exists", "examples": ["export fails in one browser"]},
+        "2": {"what": "Blocking issue; no workaround exists", "examples": ["cannot log in", "data loss"]}
+      },
+      "confidence": 0.4
+    }
+  },
+  "usage": {"input_tokens": 210, "output_tokens": 40}
+}
