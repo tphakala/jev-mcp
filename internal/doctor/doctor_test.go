@@ -110,8 +110,8 @@ func TestRunKeyFormatWarnsOnWhitespaceAndCoversHTTPToken(t *testing.T) {
 		t.Errorf("exit code = %d, want 0\n%s", code, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "[WARN] api key format") {
-		t.Errorf("expected a key-format warning\n%s", got)
+	if !strings.Contains(got, "[WARN] credential format") {
+		t.Errorf("expected a credential-format warning\n%s", got)
 	}
 	// The warning names each affected credential's env var, and never the value.
 	for _, name := range []string{config.EnvTypeSafeKey, config.EnvOpenRouterKey, config.EnvHTTPToken} {

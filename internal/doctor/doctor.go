@@ -85,7 +85,7 @@ func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe b
 	}
 
 	checks = append(checks,
-		keyFormatCheck(&cfg),
+		credentialFormatCheck(&cfg),
 		defaultModelCheck(cfg.DefaultModel),
 		httpTokenCheck(&cfg),
 	)
@@ -181,11 +181,11 @@ type namedSecret struct {
 	value string
 }
 
-// keyFormatCheck warns when a set credential has surrounding whitespace, an
+// credentialFormatCheck warns when a set credential has surrounding whitespace, an
 // embedded quote, or a control character: the usual copy-paste damage. It
 // covers the HTTP bearer token as well as the two API keys. It never prints a
 // value.
-func keyFormatCheck(cfg *config.Config) check {
+func credentialFormatCheck(cfg *config.Config) check {
 	secrets := []namedSecret{
 		{config.EnvTypeSafeKey, cfg.TypeSafeKey},
 		{config.EnvOpenRouterKey, cfg.OpenRouterKey},
@@ -198,9 +198,9 @@ func keyFormatCheck(cfg *config.Config) check {
 		}
 	}
 	if len(warnings) > 0 {
-		return check{statusWarn, "api key format", strings.Join(warnings, "; ")}
+		return check{statusWarn, "credential format", strings.Join(warnings, "; ")}
 	}
-	return check{statusPass, "api key format", "no formatting problems in set credentials"}
+	return check{statusPass, "credential format", "no formatting problems in set credentials"}
 }
 
 // tokenFormatWarning returns a description of the format problems in value, or
