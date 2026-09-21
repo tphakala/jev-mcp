@@ -1,0 +1,12 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "tone": {
+      "type": "choice",
+      "choice": "frustrated",
+      "probabilities": {"calm": 0.1, "frustrated": 0.7, "angry": 0.2},
+      "confidence": 0.62
+    }
+  },
+  "usage": {"input_tokens": 120, "output_tokens": 8}
+}

@@ -1,0 +1,9 @@
+{
+  "id": "gen-abc123",
+  "provider": "TypeSafe",
+  "model": "typesafe/jev-1.13-20260917",
+  "answers": {
+    "returning": {"type": "noul", "noul": 0.91}
+  },
+  "usage": {"input_tokens": 90, "output_tokens": 4, "cost": 0.00003}
+}

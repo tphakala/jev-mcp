@@ -1,0 +1,13 @@
+{
+  "model": "jev-1.13.0",
+  "answers": {
+    "severity": {
+      "type": "score",
+      "score": 1.43,
+      "probabilities": {"0": 0.0, "1": 0.57, "2": 0.43},
+      "legend": {"0": "Cosmetic", "1": "Degraded", "2": "Blocking"},
+      "confidence": 0.55
+    }
+  },
+  "usage": {"input_tokens": 200, "output_tokens": 12}
+}

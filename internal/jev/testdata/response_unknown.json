@@ -1,0 +1,7 @@
+{
+  "model": "jev-future",
+  "answers": {
+    "mystery": {"type": "quantum", "verdict": "maybe", "weirdness": 0.5}
+  },
+  "usage": {"input_tokens": 10, "output_tokens": 2, "extra_field": "ignored"}
+}

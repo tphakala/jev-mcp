@@ -163,6 +163,26 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: go build ./...
 
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # A short bounded run of each fuzz target on every build guards against
+      # panics on unexpected input. A crash it finds is committed under the
+      # package's testdata/fuzz directory as a regression seed. Smoke runs, not
+      # a substitute for a long local fuzz session.
+      - name: Fuzz validate
+        run: go test -run='^$' -fuzz='^FuzzValidate$' -fuzztime=20s ./internal/jev
+
   goreleaser:
     name: GoReleaser config
     runs-on: ubuntu-latest
