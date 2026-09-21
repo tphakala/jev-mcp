@@ -2,8 +2,8 @@
 // to MCP clients. main only wires the process into run, which takes its inputs
 // and outputs as parameters so tests can drive it without a subprocess.
 //
-// This pre-release build implements only -version; the serve and doctor
-// commands arrive with the tool surface in a later change.
+// This build implements -version and the read-only doctor preflight command;
+// the serve command and the MCP tool surface arrive in a later change.
 package main
 
 import (
@@ -49,6 +49,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 
+	// Subcommands are dispatched before flag parsing: the top-level flag set
+	// rejects any positional argument, so "doctor" has to be intercepted here.
+	if len(args) > 0 && args[0] == "doctor" {
+		return doctorCommand(ctx, args[1:], stdout, stderr)
+	}
+
 	showVersion, err := parseFlags(args, stderr)
 	if err != nil {
 		if errors.Is(err, errUsage) {
@@ -62,7 +68,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return writeLine(stdout, stderr, versionString())
 	}
 
-	_, _ = fmt.Fprintln(stderr, "jev-mcp: no command given; this build only implements -version")
+	_, _ = fmt.Fprintln(stderr, "jev-mcp: no command given; run 'jev-mcp -version' or 'jev-mcp doctor'")
 	return exitUsage
 }
 
