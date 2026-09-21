@@ -1,0 +1,17 @@
+# Codecov configuration.
+#
+# Coverage is a signal, not a hard gate. The CI upload step is non-blocking
+# (fail_ci_if_error: false), and these status targets sit around 80% with a
+# small threshold so an unreachable defensive guard or a deliberately untested
+# trivial setter does not fail a pull request. Aim for meaningful tests over a
+# coverage number.
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 2%
+    patch:
+      default:
+        target: 80%
+        threshold: 5%
