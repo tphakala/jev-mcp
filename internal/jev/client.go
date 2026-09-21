@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"slices"
@@ -135,10 +136,15 @@ func New(providers []Provider, opts ...Option) (*Client, error) {
 	if len(providers) == 0 {
 		return nil, ErrNoProvider
 	}
+	// Clone the slice and each provider's Headers map so a caller mutating its
+	// own copy cannot race a concurrent Evaluate (setHeaders ranges Headers).
+	providers = slices.Clone(providers)
+	for i := range providers {
+		providers[i].Headers = maps.Clone(providers[i].Headers)
+	}
 	c := &Client{
-		http: &http.Client{},
-		// Clone so a caller mutating its slice cannot race a concurrent Evaluate.
-		providers:        slices.Clone(providers),
+		http:             &http.Client{},
+		providers:        providers,
 		policy:           defaultRetryPolicy(),
 		budget:           defaultCallBudget,
 		maxResponseBytes: MaxResponseBytes,
@@ -278,6 +284,13 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 		}
 	}
 	if len(data) > c.maxResponseBytes {
+		// A non-200 body over the cap must still classify by status, or a
+		// retryable/fallback-eligible error (429, 503/529, 5xx) would be masked
+		// as ErrResponseTooLarge and skip retry and fallback. The diagnostic body
+		// is bounded here and truncated again by extractMessage.
+		if resp.StatusCode != http.StatusOK {
+			return nil, c.newAPIError(p, resp, data[:c.maxResponseBytes])
+		}
 		return nil, &APIError{
 			Provider:  p.Name,
 			Status:    resp.StatusCode,

@@ -1,6 +1,7 @@
 package jev
 
 import (
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -75,6 +76,8 @@ func TestParseRetryAfter(t *testing.T) {
 		{"ms wins over seconds", map[string]string{retryAfterMsHeader: "100", retryAfterHeader: "5"}, 100 * time.Millisecond},
 		{"ms zero falls through", map[string]string{retryAfterMsHeader: "0", retryAfterHeader: "2"}, 2 * time.Second},
 		{"seconds", map[string]string{retryAfterHeader: "2"}, 2 * time.Second},
+		// A huge value must clamp to the max duration, not overflow to negative.
+		{"seconds overflow clamped", map[string]string{retryAfterHeader: "99999999999"}, time.Duration(math.MaxInt64)},
 		{"seconds zero", map[string]string{retryAfterHeader: "0"}, 0},
 		{"seconds negative", map[string]string{retryAfterHeader: "-3"}, 0},
 		{"http-date future", map[string]string{retryAfterHeader: future}, 5 * time.Second},

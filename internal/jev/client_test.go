@@ -72,6 +72,45 @@ func TestNewNoProviders(t *testing.T) {
 	}
 }
 
+func TestNewDeepCopiesHeaders(t *testing.T) {
+	t.Parallel()
+
+	// New must own its providers, including each Headers map, so a caller
+	// mutating its own copy cannot race a concurrent Evaluate.
+	hdr := map[string]string{"X-Title": "orig"}
+	p := Provider{Name: ProviderTypeSafe, BaseURL: "https://h.test", Path: SystemOnePath, APIKey: "k", Headers: hdr}
+	c, err := New([]Provider{p})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hdr["X-Title"] = "mutated" // mutate the caller's map after construction
+	if got := c.providers[0].Headers["X-Title"]; got != "orig" {
+		t.Errorf("client Headers[X-Title] = %q, want orig: New must deep-copy the map", got)
+	}
+}
+
+func TestEvaluateOversizedErrorPreservesStatus(t *testing.T) {
+	t.Parallel()
+
+	// A retryable status whose error body exceeds the cap must still classify by
+	// status (so retry/fallback stay in play), not collapse to ErrResponseTooLarge.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, strings.Repeat("x", 100))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newTestClient(t, srv.URL, WithMaxRetries(0))
+	c.maxResponseBytes = 16
+	_, err := c.Evaluate(t.Context(), sampleRequest())
+	if !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("error = %v, want ErrOverloaded (status preserved for an oversized error body)", err)
+	}
+	if errors.Is(err, ErrResponseTooLarge) {
+		t.Error("error should not be ErrResponseTooLarge for a non-200 response")
+	}
+}
+
 func TestEvaluateRequestShapeAndSuccess(t *testing.T) {
 	t.Parallel()
 

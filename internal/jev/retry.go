@@ -1,6 +1,7 @@
 package jev
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -95,7 +96,7 @@ func (p retryPolicy) exponential(attempt int) time.Duration {
 func parseRetryAfter(h http.Header, now time.Time) time.Duration {
 	if ms := h.Get(retryAfterMsHeader); ms != "" {
 		if n, err := strconv.Atoi(ms); err == nil && n > 0 {
-			return time.Duration(n) * time.Millisecond
+			return scaleDuration(n, time.Millisecond)
 		}
 	}
 	v := h.Get(retryAfterHeader)
@@ -106,7 +107,7 @@ func parseRetryAfter(h http.Header, now time.Time) time.Duration {
 		if secs <= 0 {
 			return 0
 		}
-		return time.Duration(secs) * time.Second
+		return scaleDuration(secs, time.Second)
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := t.Sub(now); d > 0 {
@@ -114,4 +115,15 @@ func parseRetryAfter(h http.Header, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+// scaleDuration multiplies a positive n by unit, clamping to the maximum
+// duration rather than letting a hostile Retry-After overflow time.Duration into
+// a negative value. delay caps the result against MaxDelay regardless, so the
+// clamp only has to keep the value positive.
+func scaleDuration(n int, unit time.Duration) time.Duration {
+	if int64(n) > math.MaxInt64/int64(unit) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(n) * unit
 }
