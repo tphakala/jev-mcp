@@ -92,20 +92,20 @@ type evaluateInput struct {
 	State     any             `json:"state" jsonschema:"the program state to decide over: a string, or a JSON object or array whose named parts give the model context. Every question is evaluated against this same state in one parallel pass. Text only"`
 	Questions []questionInput `json:"questions"`
 	Model     string          `json:"model,omitempty" jsonschema:"Jev model id, such as jev-latest or jev-preview. Omit to use the server default"`
-	Detail    string          `json:"detail,omitempty" jsonschema:"how much the text result shows: summary (the default) gives each answer with its confidence; full also gives probabilities, legend, provider, model, usage, and latency. The structured result always carries everything"`
+	Detail    string          `json:"detail,omitempty" jsonschema:"how much the text result shows: summary (the default) gives each answer's decision, with its confidence where it has one; full also gives probabilities, legend, provider, model, usage, and latency. The structured result always carries everything"`
 }
 
 // answerOutput is the answer to one question.
 type answerOutput struct {
 	Name          string             `json:"name" jsonschema:"the question name from the input"`
-	Type          string             `json:"type" jsonschema:"choice, score, or noul, echoing the question"`
+	Type          string             `json:"type" jsonschema:"the answer's type as the provider reported it: choice, score, or noul, or another value when raw is present"`
 	Choice        string             `json:"choice,omitempty" jsonschema:"choice only: the selected option name, one of the criteria keys"`
 	Score         *float64           `json:"score,omitempty" jsonschema:"score only: probability-weighted position on the scale, from 0 to the highest level index"`
 	Noul          *float64           `json:"noul,omitempty" jsonschema:"noul only: probability from 0 to 1 that the proposition is true; this is both the answer and its certainty"`
 	Confidence    *float64           `json:"confidence,omitempty" jsonschema:"choice and score: certainty from 0 to 1; gate on it before acting"`
 	Probabilities map[string]float64 `json:"probabilities,omitempty" jsonschema:"choice: probability per option; score: probability per level index as a string key"`
 	Legend        map[string]any     `json:"legend,omitempty" jsonschema:"score only: level index to the description supplied in criteria"`
-	Raw           any                `json:"raw,omitempty" jsonschema:"the verbatim answer, present only when this server cannot read it: an unrecognised type, or a known type whose decision field is missing or malformed"`
+	Raw           any                `json:"raw,omitempty" jsonschema:"the answer as JSON, present only when this server cannot read it: a type it does not model, or a known type whose value is missing or whose fields failed to decode"`
 }
 
 // usageOutput is the token accounting for a call.
@@ -144,7 +144,7 @@ State and instructions are sent to an external API (TypeSafe, or OpenRouter). Do
 
 // evaluateDescription is the tool description. The score level range comes
 // from the jev constants so it cannot drift from what jev.Validate enforces.
-var evaluateDescription = fmt.Sprintf(`Decide one or more questions over a shared state with Jev, returning typed answers with probabilities. Three question types: choice (pick one option from criteria, an object of option name to description), score (place the state on criteria, an ordered array of %d to %d levels, lowest first), and noul (a yes/no proposition; its answer is the probability of yes). All questions in a call are evaluated together against the same state. The text result is a summary of each answer and its confidence unless detail is full; the structured result always carries everything.`,
+var evaluateDescription = fmt.Sprintf(`Decide one or more questions over a shared state with Jev, returning typed answers with probabilities. Three question types: choice (pick one option from criteria, an object of option name to description), score (place the state on criteria, an ordered array of %d to %d levels, lowest first), and noul (a yes/no proposition; its answer is the probability of yes). All questions in a call are evaluated together against the same state. The text result is a summary of each answer's decision unless detail is full; the structured result always carries everything.`,
 	jev.MinScoreLevels, jev.MaxScoreLevels)
 
 // NewServer builds the MCP server with jev_evaluate registered.
@@ -208,7 +208,7 @@ func evaluateInputSchema() *jsonschema.Schema {
 	return s
 }
 
-// rawQuestion and rawInput mirror questionInput and evaluateInput with the
+// rawQuestion and rawEnvelope mirror questionInput and evaluateInput with the
 // union-typed fields kept as raw JSON. The SDK decodes the arguments into a
 // map[string]any, validates it, and marshals it again for the typed input
 // (go-sdk v1.8.0 mcp/tool.go applySchema), which turns every JSON number into
@@ -389,7 +389,7 @@ func orderedAnswerNames(answers map[string]jev.Answer, asked []string) []string 
 // an option, a score or a noul with its number. It is false for a type this
 // server does not model, and for a known type whose value is missing or whose
 // fields failed to decode (jev.Response.UnmarshalJSON then keeps only Type and
-// Raw). Such an answer is passed through verbatim instead of being shown as a
+// Raw). Such an answer is passed through as JSON instead of being shown as a
 // decision with no value.
 func readable(a *jev.Answer) bool {
 	switch a.Type {
@@ -422,7 +422,7 @@ func toOutput(res *jev.Result, asked []string) (evaluateOutput, error) {
 		ao := answerOutput{Name: name, Type: string(a.Type)}
 		if !readable(&a) {
 			// Like the summary, an answer this server cannot read carries only
-			// its verbatim form, not whichever typed fields happened to decode.
+			// its raw form, not whichever typed fields happened to decode.
 			if err := json.Unmarshal(a.Raw, &ao.Raw); err != nil {
 				return evaluateOutput{}, fmt.Errorf("%w: answer %q: %w", jev.ErrMalformedResponse, name, err)
 			}
@@ -432,7 +432,11 @@ func toOutput(res *jev.Result, asked []string) (evaluateOutput, error) {
 		ao.Choice = a.Choice
 		ao.Score = a.Score
 		ao.Noul = a.Noul
-		ao.Confidence = a.Confidence
+		if a.Type != jev.TypeNoul {
+			// Jev sends no confidence for noul, whose value is its own
+			// certainty; the summary omits one too, so both results agree.
+			ao.Confidence = a.Confidence
+		}
 		ao.Probabilities = a.Probabilities
 		if len(a.Legend) > 0 {
 			ao.Legend = make(map[string]any, len(a.Legend))

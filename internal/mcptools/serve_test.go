@@ -172,8 +172,8 @@ func TestHTTPServeAdvertisesToolAndInstructions(t *testing.T) {
 	}
 }
 
-// TestServeHTTPShutsDownOnCancel starts the real listener, confirms it
-// answers, and checks that cancelling the context stops it cleanly.
+// TestServeHTTPShutsDownOnCancel starts the real listener, confirms it is
+// listening, and checks that cancelling the context stops it cleanly.
 func TestServeHTTPShutsDownOnCancel(t *testing.T) {
 	t.Parallel()
 

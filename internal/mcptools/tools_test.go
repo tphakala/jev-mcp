@@ -259,8 +259,9 @@ func TestEvaluateSendsArgumentsVerbatim(t *testing.T) {
 
 // TestEvaluateUnreadableAndEdgeAnswers covers answers the summary cannot
 // render as a decision: a known type whose value field is malformed or
-// missing is passed through verbatim under raw in both the text and the
-// structured result, rather than shown as a decision with no value. It also
+// missing is passed through under raw in both the text and the structured
+// result, with no typed fields beside it, rather than shown as a decision with
+// no value. It also
 // pins a score with no confidence and a number too large to round.
 func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 	t.Parallel()
@@ -285,13 +286,14 @@ func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 		},
 		{
 			name:     "score missing its value",
-			answer:   `{"type":"score","confidence":0.5}`,
-			wantText: `{"answers":[{"name":"q","raw":{"type":"score","confidence":0.5}}]}`,
+			answer:   `{"type":"score","confidence":0.5,"probabilities":{"0":1},"legend":{"0":"low"}}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"score","confidence":0.5,"probabilities":{"0":1},"legend":{"0":"low"}}}]}`,
 			wantRaw:  true,
 		},
 		{
-			// Jev sends no confidence for noul; if one arrives, the summary
-			// still shows only the probability, which is its own certainty.
+			// Jev sends no confidence for noul; if one arrives, neither the
+			// summary nor the structured result shows it, since the
+			// probability is its own certainty.
 			name:     "noul with an unexpected confidence",
 			answer:   `{"type":"noul","noul":0.25,"confidence":0.9}`,
 			wantText: `{"answers":[{"name":"q","noul":0.25}]}`,
@@ -334,6 +336,9 @@ func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 			if tt.wantRaw && typed {
 				t.Errorf("unreadable answer carries typed fields beside raw: %+v", a)
 			}
+			if a.Type == string(jev.TypeNoul) && a.Confidence != nil {
+				t.Errorf("noul answer carries a confidence in the structured result: %v", *a.Confidence)
+			}
 		})
 	}
 }
@@ -372,7 +377,7 @@ func TestEvaluateLogsWithoutContent(t *testing.T) {
 		map[string]any{"name": "q", "type": "noul", "instructions": markerInstr},
 	}}
 	// A result whose legend is not valid JSON cannot occur from a real
-	// decode, but it is the one way to make rendering fail after the client
+	// decode, but it is one way to make rendering fail after the client
 	// has answered, which must be logged as a failure, not a success.
 	unrenderable := &jev.Result{Model: "m", Answers: map[string]jev.Answer{
 		"q": {Type: jev.TypeScore, Score: new(1.0), Legend: map[string]json.RawMessage{"0": json.RawMessage("{")}},
@@ -432,11 +437,11 @@ func TestEvaluateDuplicateQuestionsKey(t *testing.T) {
 	}
 }
 
-// TestRawInputMirrorsSchemaInput guards the two views of the tool input
+// TestRawEnvelopeMirrorsSchemaInput guards the two views of the tool input
 // against drift: every JSON field the schema advertises (evaluateInput,
 // questionInput) must be decoded by the handler (rawEnvelope, rawQuestion),
 // and the other way round.
-func TestRawInputMirrorsSchemaInput(t *testing.T) {
+func TestRawEnvelopeMirrorsSchemaInput(t *testing.T) {
 	t.Parallel()
 
 	jsonNames := func(v any) []string {
@@ -649,17 +654,15 @@ func TestEvaluateInputSchema(t *testing.T) {
 				Enum []string `json:"enum"`
 			} `json:"detail"`
 			Questions struct {
-				Type        string `json:"type"`
-				Description string `json:"description"`
-				MinItems    int    `json:"minItems"`
-				MaxItems    int    `json:"maxItems"`
-				Items       struct {
+				Type     string `json:"type"`
+				MinItems int    `json:"minItems"`
+				MaxItems int    `json:"maxItems"`
+				Items    struct {
 					Required   []string `json:"required"`
 					Properties struct {
 						Name struct {
-							MinLength   int    `json:"minLength"`
-							MaxLength   int    `json:"maxLength"`
-							Description string `json:"description"`
+							MinLength int `json:"minLength"`
+							MaxLength int `json:"maxLength"`
 						} `json:"name"`
 						Type struct {
 							Enum []string `json:"enum"`
@@ -668,8 +671,7 @@ func TestEvaluateInputSchema(t *testing.T) {
 							Type []string `json:"type"`
 						} `json:"instructions"`
 						Criteria struct {
-							Type        []string `json:"type"`
-							Description string   `json:"description"`
+							Type []string `json:"type"`
 						} `json:"criteria"`
 					} `json:"properties"`
 				} `json:"items"`
