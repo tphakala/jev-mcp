@@ -2,8 +2,8 @@
 // environment into a single [Config] value. It reads the environment through an
 // injected getenv function so callers and tests stay in control of the source,
 // and it never performs network I/O. Turning a [Config] into an ordered list of
-// providers is [Select]'s job; serving and diagnosing it will belong to the
-// serve and doctor packages.
+// providers is [Select]'s job; serving it belongs to cmd/jev-mcp and
+// internal/mcptools, and diagnosing it to internal/doctor.
 //
 // Secrets (the API keys and the HTTP bearer token) are held on the [Config] but
 // never recorded in [Config.Sources] and never logged, so the resolved

@@ -3,6 +3,7 @@ package mcptools
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -303,6 +304,29 @@ func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 	}
 }
 
+// TestEvaluateAcceptsNullNoulCriteria pins that a noul question may pass
+// criteria as null, which jev.Validate accepts, and that it reaches Jev as
+// null rather than being dropped or rejected by the schema.
+func TestEvaluateAcceptsNullNoulCriteria(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), map[string]any{
+		"state":     "s",
+		"questions": []any{map[string]any{"name": "spam", "type": "noul", "instructions": "q", "criteria": nil}},
+	})
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	if got := string(reqs[0].Questions["spam"].Criteria); got != "null" {
+		t.Fatalf("criteria = %q, want null", got)
+	}
+}
+
 // TestEvaluateOrdersAnswers pins the answer order when the provider's answers
 // do not match the questions: a missing answer is left out, and an answer for
 // a name that was not asked follows the asked ones in name order.
@@ -369,6 +393,12 @@ func TestEvaluateToolErrors(t *testing.T) {
 			name:     "missing questions",
 			client:   &fakeEvaluator{},
 			args:     map[string]any{"state": "s"},
+			wantText: []string{"questions"},
+		},
+		{
+			name:     "null questions",
+			client:   &fakeEvaluator{},
+			args:     map[string]any{"state": "s", "questions": nil},
 			wantText: []string{"questions"},
 		},
 		{
@@ -445,9 +475,11 @@ func TestEvaluateInputSchema(t *testing.T) {
 				Enum []string `json:"enum"`
 			} `json:"detail"`
 			Questions struct {
-				MinItems int `json:"minItems"`
-				MaxItems int `json:"maxItems"`
-				Items    struct {
+				Type        string `json:"type"`
+				Description string `json:"description"`
+				MinItems    int    `json:"minItems"`
+				MaxItems    int    `json:"maxItems"`
+				Items       struct {
 					Required   []string `json:"required"`
 					Properties struct {
 						Name struct {
@@ -461,7 +493,8 @@ func TestEvaluateInputSchema(t *testing.T) {
 							Type []string `json:"type"`
 						} `json:"instructions"`
 						Criteria struct {
-							Type []string `json:"type"`
+							Type        []string `json:"type"`
+							Description string   `json:"description"`
 						} `json:"criteria"`
 					} `json:"properties"`
 				} `json:"items"`
@@ -483,12 +516,26 @@ func TestEvaluateInputSchema(t *testing.T) {
 		{"question required", p.Questions.Items.Required, []string{"instructions", "name", "type"}},
 		{"question type enum", q.Type.Enum, []string{"choice", "noul", "score"}},
 		{"instructions type", q.Instructions.Type, []string{"array", "object", "string"}},
-		{"criteria type", q.Criteria.Type, []string{"array", "object"}},
+		{"criteria type", q.Criteria.Type, []string{"array", "null", "object"}},
 	}
 	for _, c := range checks {
 		got := slices.Sorted(slices.Values(c.got))
 		if !slices.Equal(got, c.want) {
 			t.Errorf("%s = %v, want %v", c.what, got, c.want)
+		}
+	}
+	if p.Questions.Type != "array" {
+		t.Errorf("questions type = %q, want array (not nullable)", p.Questions.Type)
+	}
+	if want := fmt.Sprintf("1 to %d per call", jev.MaxQuestions); !strings.Contains(p.Questions.Description, want) {
+		t.Errorf("questions description %q does not quote the limit %q", p.Questions.Description, want)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("%d to %d options", jev.MinChoiceOptions, jev.MaxChoiceOptions),
+		fmt.Sprintf("%d to %d level descriptions", jev.MinScoreLevels, jev.MaxScoreLevels),
+	} {
+		if !strings.Contains(q.Criteria.Description, want) {
+			t.Errorf("criteria description %q does not quote %q", q.Criteria.Description, want)
 		}
 	}
 	if p.Questions.MinItems != 1 || p.Questions.MaxItems != jev.MaxQuestions {

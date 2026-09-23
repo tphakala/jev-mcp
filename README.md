@@ -20,15 +20,18 @@ Requires Go 1.27 or later. Binaries for linux, darwin and windows are attached t
 
 ## Status
 
-Pre-release and under active construction. This build implements only the `-version` command; the Jev HTTP client, the `jev_evaluate` MCP tool, and the stdio and HTTP serve modes are landing incrementally. Nothing here is stable yet.
+Pre-release. The `jev_evaluate` MCP tool is served over stdio or loopback HTTP, and `jev-mcp doctor` checks the configuration. The configuration reference, the tool schema, and a Claude Code configuration snippet land with v0.1.0. Nothing here is stable yet.
 
 ## Usage
 
 ```
+jev-mcp                        # serve MCP over stdio
+jev-mcp -http 127.0.0.1:8765   # serve Streamable HTTP on a loopback address
+jev-mcp doctor [-probe]        # check the configuration and providers
 jev-mcp -version
 ```
 
-Serve and doctor commands, the tool schema, and a Claude Code configuration snippet are documented here as they land.
+Serving needs `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY` in the environment. Stdio mode reads requests from stdin, so a container needs `docker run -i`.
 
 ## Development
 

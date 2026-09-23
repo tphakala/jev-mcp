@@ -38,6 +38,7 @@ const (
 	jsonString = "string"
 	jsonObject = "object"
 	jsonArray  = "array"
+	jsonNull   = "null"
 )
 
 // summaryPrecision is the number of decimal places kept for the numbers in the
@@ -67,27 +68,29 @@ type Deps struct {
 	Client Evaluator
 	// DefaultModel is used when a call omits model.
 	DefaultModel string
-	// Logger receives one record per call. A nil Logger discards.
+	// Logger receives one record for each call that reaches the Jev client. A
+	// nil Logger discards.
 	Logger *slog.Logger
 }
 
 // questionInput is one question in a jev_evaluate call.
 //
 // The jsonschema tags are the per-property descriptions the client sees. The
-// union-typed fields (instructions, criteria) get explicit JSON types in
-// inputSchema, because the schema derived from an interface field has none.
+// union-typed fields (instructions, criteria) get explicit JSON types, and the
+// descriptions that quote a limit are rewritten from the jev constants, in
+// evaluateInputSchema.
 type questionInput struct {
-	Name         string `json:"name" jsonschema:"a name for this question, unique within the call; its answer comes back under the same name"`
+	Name         string `json:"name"`
 	Type         string `json:"type" jsonschema:"choice picks exactly one option from criteria; score places the state on the ordered scale given by criteria; noul answers a yes/no proposition"`
-	Instructions any    `json:"instructions" jsonschema:"the question to decide, evaluated against state. A plain string is usual; an object with keys such as question, focus, note, or field is also accepted"`
-	Criteria     any    `json:"criteria,omitempty" jsonschema:"choice (required): an object mapping each option name to its description (2 to 255 options); a description may be a string, an object such as {what, not_for, examples}, or null. score (required): an ordered array of 2 to 10 level descriptions, index 0 lowest. noul (optional): an object with true and false descriptions"`
+	Instructions any    `json:"instructions" jsonschema:"the question to decide, evaluated against state. A plain string is usual; an object (keys such as question, focus, note, or field) or an array is also accepted"`
+	Criteria     any    `json:"criteria,omitempty"`
 }
 
 // evaluateInput is the input for jev_evaluate.
 type evaluateInput struct {
 	State     any             `json:"state" jsonschema:"the program state to decide over: a string, or a JSON object or array whose named parts give the model context. Every question is evaluated against this same state in one parallel pass. Text only"`
-	Questions []questionInput `json:"questions" jsonschema:"the decisions to make over state, 1 to 64 per call. Batching related decisions into one call is cheaper and faster than several calls"`
-	Model     string          `json:"model,omitempty" jsonschema:"Jev model id: jev-latest, jev-preview, or a pinned version such as jev-1.13. Omit to use the server default"`
+	Questions []questionInput `json:"questions"`
+	Model     string          `json:"model,omitempty" jsonschema:"Jev model id: jev-latest, jev-preview, or a pinned version (jev-1.13.0 on TypeSafe, jev-1.13 on OpenRouter). Omit to use the server default"`
 	Detail    string          `json:"detail,omitempty" jsonschema:"how much the text result shows: summary (the default) gives each answer with its confidence; full also gives probabilities, legend, provider, model, usage, and latency. The structured result always carries everything"`
 }
 
@@ -115,7 +118,7 @@ type usageOutput struct {
 type evaluateOutput struct {
 	Provider  string         `json:"provider" jsonschema:"the backend that answered, typesafe or openrouter, after any fallback"`
 	Model     string         `json:"model" jsonschema:"the model id the provider reports"`
-	Answers   []answerOutput `json:"answers" jsonschema:"one answer per question, in the order the questions were given"`
+	Answers   []answerOutput `json:"answers" jsonschema:"the answers the provider returned, in the order the questions were given; a question the provider did not answer is absent"`
 	Usage     usageOutput    `json:"usage" jsonschema:"token accounting for this call"`
 	LatencyMS int64          `json:"latency_ms" jsonschema:"wall-clock milliseconds of the provider call that answered"`
 	Attempts  int            `json:"attempts" jsonschema:"HTTP attempts made across retries and fallback; 1 is the normal case"`
@@ -130,21 +133,27 @@ var annDecide = &mcp.ToolAnnotations{
 	OpenWorldHint: new(true),
 }
 
-const serverInstructions = `jev-mcp gives you typed, probabilistic decisions from Jev, a fast non-generative model: you pass a state and one or more questions, and every answer is guaranteed to be a value you defined. It does not write text.
+const serverInstructions = `jev-mcp gives you typed, probabilistic decisions from Jev, a fast non-generative model: you pass a state and one or more questions and get back answers shaped by the criteria you defined. A choice answer is always one of your options; score and noul answers are numbers on the scale you defined. It does not write text.
 
-Use jev_evaluate for routing, classification, triage, gating, and scoring: "which of these options fits", "where on this scale", "is this true". It answers in well under a second and costs far less than a language-model call, so it suits decisions made many times or inside a loop. Do not use it to generate, summarise, or explain.
+Use jev_evaluate for routing, classification, triage, gating, and scoring: "which of these options fits", "where on this scale", "is this true". It typically answers in under a second and costs far less than a language-model call, so it suits decisions made many times or inside a loop. Do not use it to generate, summarise, or explain.
 
-Batch related questions over the same state into one call. Gate on confidence (or on the noul probability) before acting on an answer; when it is low and you need the alternatives, call again with detail set to full to see the probabilities.
+Batch related questions over the same state into one call. Gate on confidence (or on the noul probability) before acting on an answer. When it is low and you need the alternatives, read the probabilities from the structured result; if your client shows you only the text, call again with detail set to full.
 
 State and instructions are sent to an external API (TypeSafe, or OpenRouter). Do not include secrets.`
 
-const evaluateDescription = `Decide one or more questions over a shared state with Jev, returning typed answers with calibrated probabilities. Three question types: choice (pick one option from criteria, an object of option name to description), score (place the state on criteria, an ordered array of 2 to 10 levels, lowest first), and noul (a yes/no proposition; its answer is the probability of yes). All questions in a call are evaluated together against the same state. The text result is a summary of each answer and its confidence unless detail is full; the structured result always carries everything.`
+// evaluateDescription is the tool description. The score level range comes
+// from the jev constants so it cannot drift from what jev.Validate enforces.
+var evaluateDescription = fmt.Sprintf(`Decide one or more questions over a shared state with Jev, returning typed answers with probabilities. Three question types: choice (pick one option from criteria, an object of option name to description), score (place the state on criteria, an ordered array of %d to %d levels, lowest first), and noul (a yes/no proposition; its answer is the probability of yes). All questions in a call are evaluated together against the same state. The text result is a summary of each answer and its confidence unless detail is full; the structured result always carries everything.`,
+	jev.MinScoreLevels, jev.MaxScoreLevels)
 
 // NewServer builds the MCP server with jev_evaluate registered.
 func NewServer(d Deps) *mcp.Server {
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
+	// ServerOptions.Logger stays unset, so the SDK discards its own records:
+	// they are preformatted strings, and a normal shutdown is logged at Error
+	// ("server run cancelled", go-sdk v1.8.0 mcp/server.go Server.Run).
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "jev-mcp", Version: jevmcp.Version},
 		&mcp.ServerOptions{Instructions: serverInstructions},
@@ -162,8 +171,8 @@ func NewServer(d Deps) *mcp.Server {
 // evaluateInputSchema derives the input schema from evaluateInput and then
 // states what the Go types cannot: the JSON types a union-typed field accepts
 // (an interface field is otherwise rendered with no type at all), the enums,
-// and the question count bounds. The SDK validates arguments against this
-// schema before the handler runs.
+// the question bounds, and the descriptions that quote a jev limit. The SDK
+// validates arguments against this schema before the handler runs.
 func evaluateInputSchema() *jsonschema.Schema {
 	s, err := jsonschema.For[evaluateInput](nil)
 	if err != nil {
@@ -175,15 +184,26 @@ func evaluateInputSchema() *jsonschema.Schema {
 	s.Properties["detail"].Enum = []any{detailSummary, detailFull}
 
 	questions := s.Properties["questions"]
+	// A slice is derived as ["null", "array"]; null is not a valid value.
+	questions.Types = nil
+	questions.Type = jsonArray
 	questions.MinItems = new(1)
 	questions.MaxItems = new(jev.MaxQuestions)
+	questions.Description = fmt.Sprintf("the decisions to make over state, 1 to %d per call. Batching related decisions into one call is cheaper and faster than several calls", jev.MaxQuestions)
 
 	q := questions.Items
-	q.Properties["name"].MinLength = new(1)
-	q.Properties["name"].MaxLength = new(jev.MaxQuestionNameBytes)
+	name := q.Properties["name"]
+	name.MinLength = new(1)
+	// maxLength counts characters and jev counts bytes, so the schema bound is
+	// looser for non-ASCII names; jev.Validate enforces the byte limit.
+	name.MaxLength = new(jev.MaxQuestionNameBytes)
+	name.Description = fmt.Sprintf("a name for this question, unique within the call and at most %d bytes; its answer comes back under the same name", jev.MaxQuestionNameBytes)
 	q.Properties["type"].Enum = []any{string(jev.TypeChoice), string(jev.TypeScore), string(jev.TypeNoul)}
 	q.Properties["instructions"].Types = []string{jsonString, jsonObject, jsonArray}
-	q.Properties["criteria"].Types = []string{jsonObject, jsonArray}
+	criteria := q.Properties["criteria"]
+	criteria.Types = []string{jsonObject, jsonArray, jsonNull}
+	criteria.Description = fmt.Sprintf("choice (required): an object mapping each option name to its description (%d to %d options); a description may be a string, an object such as {what, not_for, examples}, or null. score (required): an ordered array of %d to %d level descriptions, index 0 lowest. noul (optional): an object with true and false descriptions, or omitted",
+		jev.MinChoiceOptions, jev.MaxChoiceOptions, jev.MinScoreLevels, jev.MaxScoreLevels)
 	return s
 }
 
@@ -229,33 +249,36 @@ func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluat
 			slog.String("error", err.Error()))
 		return nil, evaluateOutput{}, err
 	}
+	names := questionNames(in.Questions)
+	out, err := toOutput(res, names)
+	var text string
+	if err == nil && detail != detailFull {
+		text, err = summaryText(res, names)
+	}
+	if err != nil {
+		d.Logger.WarnContext(ctx, logMsgFailed,
+			slog.Int("questions", len(req.Questions)),
+			slog.String("error", err.Error()))
+		return nil, evaluateOutput{}, err
+	}
 	d.Logger.InfoContext(ctx, logMsgEvaluated,
 		slog.String("provider", res.ProviderName),
 		slog.String("model", res.Model),
 		slog.Int("questions", len(req.Questions)),
 		slog.Int("attempts", res.Attempts),
 		slog.Duration("latency", res.Latency))
-
-	names := questionNames(in.Questions)
-	out, err := toOutput(res, names)
-	if err != nil {
-		return nil, evaluateOutput{}, err
-	}
 	if detail == detailFull {
 		// A nil result makes the SDK mirror the full structured output into the
 		// text content.
 		return nil, out, nil
 	}
-	text, err := summaryText(res, names)
-	if err != nil {
-		return nil, evaluateOutput{}, err
-	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
 }
 
-// toRequest checks the input the schema cannot express and builds the Jev
-// request. The per-question rules live in jev.Validate, which Client.Evaluate
-// runs, so they are not repeated here.
+// toRequest rejects what the schema cannot express (a duplicate question
+// name), re-checks detail for callers that bypass the schema, and builds the
+// Jev request. The per-question rules live in jev.Validate, which
+// Client.Evaluate runs, so they are not repeated here.
 func (d Deps) toRequest(in *rawInput) (string, jev.Request, error) {
 	detail := in.Detail
 	switch detail {
