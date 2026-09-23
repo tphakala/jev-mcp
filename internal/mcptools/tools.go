@@ -101,7 +101,7 @@ type answerOutput struct {
 	Confidence    *float64           `json:"confidence,omitempty" jsonschema:"choice and score: certainty from 0 to 1; gate on it before acting"`
 	Probabilities map[string]float64 `json:"probabilities,omitempty" jsonschema:"choice: probability per option; score: probability per level index as a string key"`
 	Legend        map[string]any     `json:"legend,omitempty" jsonschema:"score only: level index to the description supplied in criteria"`
-	Raw           any                `json:"raw,omitempty" jsonschema:"the verbatim answer, present only when its type is not one this server recognises"`
+	Raw           any                `json:"raw,omitempty" jsonschema:"the verbatim answer, present only when this server cannot read it: an unrecognised type, or a known type whose decision field is missing or malformed"`
 }
 
 // usageOutput is the token accounting for a call.
@@ -315,11 +315,20 @@ func orderedAnswerNames(answers map[string]jev.Answer, asked []string) []string 
 	return append(out, extra...)
 }
 
-// knownType reports whether t is one of the primitives this server models.
-func knownType(t jev.QuestionType) bool {
-	switch t {
-	case jev.TypeChoice, jev.TypeScore, jev.TypeNoul:
-		return true
+// readable reports whether a carries the decision for its type: a choice with
+// an option, a score or a noul with its number. It is false for a type this
+// server does not model, and for a known type whose fields failed to decode,
+// which jev.Response.UnmarshalJSON reports by keeping only Type and Raw. Such
+// an answer is passed through verbatim instead of being shown as a decision
+// with no value.
+func readable(a *jev.Answer) bool {
+	switch a.Type {
+	case jev.TypeChoice:
+		return a.Choice != ""
+	case jev.TypeScore:
+		return a.Score != nil
+	case jev.TypeNoul:
+		return a.Noul != nil
 	}
 	return false
 }
@@ -359,7 +368,7 @@ func toOutput(res *jev.Result, asked []string) (evaluateOutput, error) {
 				ao.Legend[k] = v
 			}
 		}
-		if !knownType(a.Type) {
+		if !readable(&a) {
 			if err := json.Unmarshal(a.Raw, &ao.Raw); err != nil {
 				return evaluateOutput{}, fmt.Errorf("%w: answer %q: %w", jev.ErrMalformedResponse, name, err)
 			}
@@ -382,23 +391,23 @@ type summaryAnswer struct {
 
 // summaryText renders the compact text result: each answer's decision and
 // confidence, in input order, with numbers rounded to summaryPrecision places.
-// An answer of an unrecognised type is shown verbatim under raw.
+// An answer that is not readable is shown verbatim under raw.
 func summaryText(res *jev.Result, asked []string) (string, error) {
 	answers := make([]summaryAnswer, 0, len(res.Answers))
 	for _, name := range orderedAnswerNames(res.Answers, asked) {
 		a := res.Answers[name]
 		sa := summaryAnswer{Name: name}
-		switch a.Type {
-		case jev.TypeChoice:
+		switch {
+		case !readable(&a):
+			sa.Raw = a.Raw
+		case a.Type == jev.TypeChoice:
 			sa.Choice = a.Choice
 			sa.Confidence = roundPtr(a.Confidence)
-		case jev.TypeScore:
+		case a.Type == jev.TypeScore:
 			sa.Score = roundPtr(a.Score)
 			sa.Confidence = roundPtr(a.Confidence)
-		case jev.TypeNoul:
+		default: // a readable noul
 			sa.Noul = roundPtr(a.Noul)
-		default:
-			sa.Raw = a.Raw
 		}
 		answers = append(answers, sa)
 	}
@@ -417,5 +426,11 @@ func roundPtr(p *float64) *float64 {
 		return nil
 	}
 	scale := math.Pow10(summaryPrecision)
-	return new(math.Round(*p*scale) / scale)
+	r := math.Round(*p*scale) / scale
+	if math.IsInf(r, 0) {
+		// Scaling overflowed a value near the float64 limit; it has no
+		// fractional digits to round away, so keep it as is.
+		return p
+	}
+	return &r
 }

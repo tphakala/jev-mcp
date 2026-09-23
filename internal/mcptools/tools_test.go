@@ -234,6 +234,75 @@ func TestEvaluateSendsArgumentsVerbatim(t *testing.T) {
 	}
 }
 
+// TestEvaluateUnreadableAndEdgeAnswers covers answers the summary cannot
+// render as a decision: a known type whose value field is malformed or
+// missing is passed through verbatim under raw in both the text and the
+// structured result, rather than shown as a decision with no value. It also
+// pins a score with no confidence and a number too large to round.
+func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		answer   string
+		wantText string
+		wantRaw  bool
+	}{
+		{
+			name:     "choice with malformed confidence",
+			answer:   `{"type":"choice","choice":"a","confidence":"high"}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"choice","choice":"a","confidence":"high"}}]}`,
+			wantRaw:  true,
+		},
+		{
+			name:     "noul with malformed value",
+			answer:   `{"type":"noul","noul":"yes"}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"noul","noul":"yes"}}]}`,
+			wantRaw:  true,
+		},
+		{
+			name:     "score missing its value",
+			answer:   `{"type":"score","confidence":0.5}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"score","confidence":0.5}}]}`,
+			wantRaw:  true,
+		},
+		{
+			name:     "score without confidence",
+			answer:   `{"type":"score","score":1.5}`,
+			wantText: `{"answers":[{"name":"q","score":1.5}]}`,
+		},
+		{
+			name:     "score too large to round",
+			answer:   `{"type":"score","score":1e306,"confidence":0.25}`,
+			wantText: `{"answers":[{"name":"q","score":1e+306,"confidence":0.25}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			body := `{"model":"m","answers":{"q":` + tt.answer + `},"usage":{"input_tokens":1,"output_tokens":1}}`
+			fake := &fakeEvaluator{res: resultFrom(t, body)}
+			args := map[string]any{"state": "s", "questions": []any{
+				map[string]any{"name": "q", "type": "noul", "instructions": "q"},
+			}}
+			res := callEvaluate(t, connect(t, Deps{Client: fake}), args)
+			if res.IsError {
+				t.Fatalf("tool error: %s", resultText(t, res))
+			}
+			if got := resultText(t, res); got != tt.wantText {
+				t.Errorf("summary text:\n got %s\nwant %s", got, tt.wantText)
+			}
+			out := structured(t, res)
+			if len(out.Answers) != 1 {
+				t.Fatalf("got %d answers, want 1", len(out.Answers))
+			}
+			if gotRaw := out.Answers[0].Raw != nil; gotRaw != tt.wantRaw {
+				t.Errorf("structured raw present = %v, want %v", gotRaw, tt.wantRaw)
+			}
+		})
+	}
+}
+
 // TestEvaluateOrdersAnswers pins the answer order when the provider's answers
 // do not match the questions: a missing answer is left out, and an answer for
 // a name that was not asked follows the asked ones in name order.
