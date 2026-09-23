@@ -95,6 +95,7 @@ func TestHTTPBearerAuth(t *testing.T) {
 		{name: "wrong token", authHeader: "Bearer wrong", wantStatus: http.StatusUnauthorized},
 		{name: "wrong scheme", authHeader: "Basic s3cret", wantStatus: http.StatusUnauthorized},
 		{name: "token prefix only", authHeader: "Bearer s3cre", wantStatus: http.StatusUnauthorized},
+		{name: "empty credential", authHeader: "Bearer ", wantStatus: http.StatusUnauthorized},
 		// RFC 7235: the auth-scheme is case-insensitive.
 		{name: "lowercase scheme", authHeader: "bearer s3cret"},
 		{name: "correct token", authHeader: "Bearer s3cret"},
@@ -132,14 +133,14 @@ func TestHTTPBearerAuth(t *testing.T) {
 }
 
 // TestHTTPNoTokenSkipsAuth pins the default: with no token configured, a
-// request without Authorization reaches the MCP handler.
+// client sending no Authorization header completes a session.
 func TestHTTPNoTokenSkipsAuth(t *testing.T) {
 	t.Parallel()
 
 	ts := httptest.NewServer(HTTPHandler(Deps{}, ""))
 	t.Cleanup(ts.Close)
-	if got := statusOf(t, postJSON(t, ts.URL, `{}`)); got == http.StatusUnauthorized {
-		t.Fatal("no token configured: request must not be rejected with 401")
+	if _, err := connectHTTP(t, ts.URL, nil).ListTools(t.Context(), nil); err != nil {
+		t.Fatalf("list tools without a token: %v", err)
 	}
 }
 
@@ -217,9 +218,14 @@ func TestServeHTTPBindFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	err = ServeHTTP(t.Context(), Deps{}, ln.Addr().String(), "")
+	// Bounded, so a regression that binds after all fails instead of serving
+	// until the package timeout.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = ServeHTTP(ctx, Deps{}, ln.Addr().String(), "")
 	if err == nil {
-		t.Fatal("ServeHTTP on a taken port = nil, want a bind error")
+		t.Fatalf("ServeHTTP on a taken port = nil after %v, want a bind error", time.Since(start))
 	}
 }
 
@@ -267,9 +273,9 @@ func TestServeStdio(t *testing.T) {
 
 	select {
 	case err := <-done:
-		// The client hanging up ends the session; how the SDK reports that
-		// (nil or EOF) is not this test's concern, only that it returns.
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+		// A client hang-up is a clean end of session: nil, or io.EOF, which is
+		// what cmd/jev-mcp treats as a normal exit.
+		if err != nil && !errors.Is(err, io.EOF) {
 			t.Fatalf("ServeStdio = %v", err)
 		}
 	case <-time.After(10 * time.Second):

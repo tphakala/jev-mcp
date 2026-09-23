@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
@@ -20,9 +21,9 @@ import (
 const mixedResponse = `{"model":"jev-1.13.0","answers":{` +
 	`"route":{"type":"choice","choice":"billing","confidence":0.87341,"probabilities":{"billing":0.87341,"tech":0.12659}},` +
 	`"severity":{"type":"score","score":1.23456,"confidence":0.6,"probabilities":{"0":0.1,"1":0.5,"2":0.4},"legend":{"0":"low","1":{"what":"medium"},"2":"high"}},` +
-	`"spam":{"type":"noul","noul":0.01234},` +
+	`"spam":{"type":"noul","noul":0.01234,"confidence":0.9},` +
 	`"future":{"type":"rank","order":["a","b"]}},` +
-	`"usage":{"input_tokens":120,"output_tokens":4}}`
+	`"usage":{"input_tokens":120,"output_tokens":4,"cost":0.00012}}`
 
 // mixedArgs asks the questions mixedResponse answers, in an order that is not
 // sorted, so the tests can tell input order from map or name order.
@@ -92,8 +93,11 @@ func TestEvaluateStructuredOutputIsFull(t *testing.T) {
 	if out.Provider != jev.ProviderTypeSafe || out.Model != "jev-1.13.0" || out.Attempts != 1 {
 		t.Errorf("provider/model/attempts = %q/%q/%d", out.Provider, out.Model, out.Attempts)
 	}
-	if out.Usage.InputTokens != 120 || out.Usage.OutputTokens != 4 {
+	if out.Usage.InputTokens != 120 || out.Usage.OutputTokens != 4 || out.Usage.Cost == nil || *out.Usage.Cost != 0.00012 {
 		t.Errorf("usage = %+v", out.Usage)
+	}
+	if out.LatencyMS != fixtureLatency.Milliseconds() {
+		t.Errorf("latency_ms = %d, want %d", out.LatencyMS, fixtureLatency.Milliseconds())
 	}
 	if names, want := answerNames(out.Answers), []string{"route", "severity", "spam", "future"}; !slices.Equal(names, want) {
 		t.Fatalf("answer order = %v, want %v", names, want)
@@ -102,26 +106,44 @@ func TestEvaluateStructuredOutputIsFull(t *testing.T) {
 }
 
 // assertMixedAnswers checks the answers decoded from mixedResponse, in input
-// order.
+// order. Structured numbers are not rounded; only the summary text is.
 func assertMixedAnswers(t *testing.T, answers []answerOutput) {
 	t.Helper()
-	route, severity, spam, future := answers[0], answers[1], answers[2], answers[3]
-	// Structured numbers are not rounded; only the summary text is.
-	if route.Choice != "billing" || route.Confidence == nil || *route.Confidence != 0.87341 {
+	assertChoiceAndScore(t, &answers[0], &answers[1])
+	assertNoulAndRaw(t, answers)
+}
+
+// assertChoiceAndScore checks the route (choice) and severity (score) answers.
+func assertChoiceAndScore(t *testing.T, route, severity *answerOutput) {
+	t.Helper()
+	if route.Type != "choice" || route.Choice != "billing" || route.Confidence == nil || *route.Confidence != 0.87341 {
 		t.Errorf("route = %+v", route)
 	}
 	if route.Probabilities["tech"] != 0.12659 {
 		t.Errorf("route probabilities = %v", route.Probabilities)
 	}
+	if severity.Type != "score" || severity.Score == nil || *severity.Score != 1.23456 || severity.Confidence == nil || *severity.Confidence != 0.6 {
+		t.Errorf("severity = %+v, want score 1.23456 with confidence 0.6", severity)
+	}
+	if severity.Probabilities["1"] != 0.5 {
+		t.Errorf("severity probabilities = %v", severity.Probabilities)
+	}
 	wantLegend := map[string]any{"0": "low", "1": map[string]any{"what": "medium"}, "2": "high"}
 	if !reflect.DeepEqual(severity.Legend, wantLegend) {
 		t.Errorf("severity legend = %#v, want %#v", severity.Legend, wantLegend)
 	}
-	if spam.Noul == nil || *spam.Noul != 0.01234 || spam.Confidence != nil {
+}
+
+// assertNoulAndRaw checks the spam (noul) answer and that raw appears only on
+// the answer this server cannot read.
+func assertNoulAndRaw(t *testing.T, answers []answerOutput) {
+	t.Helper()
+	route, severity, spam, future := &answers[0], &answers[1], &answers[2], &answers[3]
+	if spam.Type != "noul" || spam.Noul == nil || *spam.Noul != 0.01234 || spam.Confidence == nil || *spam.Confidence != 0.9 {
 		t.Errorf("spam = %+v", spam)
 	}
-	if spam.Raw != nil || route.Raw != nil {
-		t.Error("raw must be set only for an unrecognised answer type")
+	if route.Raw != nil || severity.Raw != nil || spam.Raw != nil {
+		t.Error("raw must be set only for an answer this server cannot read")
 	}
 	wantRaw := map[string]any{"type": "rank", "order": []any{"a", "b"}}
 	if future.Type != "rank" || !reflect.DeepEqual(future.Raw, wantRaw) {
@@ -327,16 +349,55 @@ func TestEvaluateAcceptsNullNoulCriteria(t *testing.T) {
 	}
 }
 
+// TestEvaluateLogsWithoutContent pins the log contract: one record per call
+// that reaches the client, success at Info and failure at Warn, and never the
+// state or instructions text.
+func TestEvaluateLogsWithoutContent(t *testing.T) {
+	t.Parallel()
+
+	const markerState, markerInstr = "state-marker-7f3a", "instr-marker-9c1e"
+	args := map[string]any{"state": markerState, "questions": []any{
+		map[string]any{"name": "q", "type": "noul", "instructions": markerInstr},
+	}}
+	tests := []struct {
+		name    string
+		fake    *fakeEvaluator
+		wantMsg string
+	}{
+		{name: "success", fake: &fakeEvaluator{res: resultFrom(t, mixedResponse)}, wantMsg: logMsgEvaluated},
+		{name: "failure", fake: &fakeEvaluator{err: errors.New("provider down")}, wantMsg: logMsgFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var logs strings.Builder
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			callEvaluate(t, connect(t, Deps{Client: tt.fake, Logger: logger}), args)
+			got := logs.String()
+			if strings.Count(got, "msg=") != 1 || !strings.Contains(got, tt.wantMsg) {
+				t.Errorf("logs = %q, want exactly one %q record", got, tt.wantMsg)
+			}
+			for _, marker := range []string{markerState, markerInstr} {
+				if strings.Contains(got, marker) {
+					t.Errorf("logs contain request content %q: %s", marker, got)
+				}
+			}
+		})
+	}
+}
+
 // TestEvaluateOrdersAnswers pins the answer order when the provider's answers
 // do not match the questions: a missing answer is left out, and an answer for
 // a name that was not asked follows the asked ones in name order.
 func TestEvaluateOrdersAnswers(t *testing.T) {
 	t.Parallel()
 
+	// Five unasked answers, so an accidentally sorted map iteration passes a
+	// test without the sort at most 1 time in 120.
 	const body = `{"model":"m","answers":{` +
 		`"zeta":{"type":"noul","noul":0.5},` +
-		`"b":{"type":"noul","noul":0.1},` +
-		`"a":{"type":"noul","noul":0.2}},"usage":{"input_tokens":1,"output_tokens":1}}`
+		`"e":{"type":"noul","noul":0.5},"d":{"type":"noul","noul":0.4},"c":{"type":"noul","noul":0.3},` +
+		`"b":{"type":"noul","noul":0.1},"a":{"type":"noul","noul":0.2}},"usage":{"input_tokens":1,"output_tokens":1}}`
 	fake := &fakeEvaluator{res: resultFrom(t, body)}
 	args := map[string]any{
 		"state": "s",
@@ -346,10 +407,11 @@ func TestEvaluateOrdersAnswers(t *testing.T) {
 		},
 	}
 	res := callEvaluate(t, connect(t, Deps{Client: fake}), args)
-	if names, want := answerNames(structured(t, res).Answers), []string{"zeta", "a", "b"}; !slices.Equal(names, want) {
+	if names, want := answerNames(structured(t, res).Answers), []string{"zeta", "a", "b", "c", "d", "e"}; !slices.Equal(names, want) {
 		t.Fatalf("answer order = %v, want %v", names, want)
 	}
-	const wantText = `{"answers":[{"name":"zeta","noul":0.5},{"name":"a","noul":0.2},{"name":"b","noul":0.1}]}`
+	const wantText = `{"answers":[{"name":"zeta","noul":0.5},{"name":"a","noul":0.2},{"name":"b","noul":0.1},` +
+		`{"name":"c","noul":0.3},{"name":"d","noul":0.4},{"name":"e","noul":0.5}]}`
 	if got := resultText(t, res); got != wantText {
 		t.Fatalf("summary text = %s, want %s", got, wantText)
 	}
@@ -376,34 +438,42 @@ func TestEvaluateToolErrors(t *testing.T) {
 		client   Evaluator
 		args     map[string]any
 		wantText []string
+		// rejected marks input the server must refuse before calling the
+		// client; the fake then must have seen no request.
+		rejected bool
 	}{
 		{
 			name:     "duplicate question name",
 			client:   &fakeEvaluator{},
+			rejected: true,
 			args:     map[string]any{"state": "s", "questions": []any{noul("same"), noul("same")}},
 			wantText: []string{`"same"`, "more than once"},
 		},
 		{
 			name:     "invalid detail",
 			client:   &fakeEvaluator{},
+			rejected: true,
 			args:     map[string]any{"state": "s", "questions": []any{noul("q")}, "detail": "verbose"},
 			wantText: []string{"detail"},
 		},
 		{
 			name:     "missing questions",
 			client:   &fakeEvaluator{},
+			rejected: true,
 			args:     map[string]any{"state": "s"},
 			wantText: []string{"questions"},
 		},
 		{
 			name:     "null questions",
 			client:   &fakeEvaluator{},
+			rejected: true,
 			args:     map[string]any{"state": "s", "questions": nil},
 			wantText: []string{"questions"},
 		},
 		{
 			name:     "null state",
 			client:   &fakeEvaluator{},
+			rejected: true,
 			args:     map[string]any{"state": nil, "questions": []any{noul("q")}},
 			wantText: []string{"state"},
 		},
@@ -428,6 +498,11 @@ func TestEvaluateToolErrors(t *testing.T) {
 			res := callEvaluate(t, connect(t, Deps{Client: tt.client}), tt.args)
 			if !res.IsError {
 				t.Fatalf("want a tool error, got success: %v", res.StructuredContent)
+			}
+			if fake, ok := tt.client.(*fakeEvaluator); ok && tt.rejected {
+				if n := len(fake.requests()); n != 0 {
+					t.Errorf("the client saw %d requests, want the input rejected before it", n)
+				}
 			}
 			text := resultText(t, res)
 			for _, want := range tt.wantText {
@@ -457,11 +532,12 @@ func TestToRequestRejectsInvalidDetail(t *testing.T) {
 func TestEvaluateInputSchema(t *testing.T) {
 	t.Parallel()
 
-	res, err := connect(t, Deps{}).ListTools(t.Context(), nil)
-	if err != nil {
-		t.Fatalf("list tools: %v", err)
+	tools := listRegisteredTools(t)
+	i := slices.IndexFunc(tools, func(tool *mcp.Tool) bool { return tool.Name == toolEvaluate })
+	if i < 0 {
+		t.Fatalf("%s is not registered", toolEvaluate)
 	}
-	b, err := json.Marshal(res.Tools[0].InputSchema)
+	b, err := json.Marshal(tools[i].InputSchema)
 	if err != nil {
 		t.Fatalf("marshal schema: %v", err)
 	}

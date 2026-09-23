@@ -9,7 +9,7 @@ import (
 
 // listRegisteredTools returns the tools/list payload a real client receives, so
 // these assertions run against the wire shape rather than the registration
-// literals. Listing never dispatches a handler, so no client is needed.
+// literals. Listing never dispatches a handler, so Deps needs no Evaluator.
 func listRegisteredTools(t *testing.T) []*mcp.Tool {
 	t.Helper()
 	res, err := connect(t, Deps{}).ListTools(t.Context(), nil)

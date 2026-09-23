@@ -78,7 +78,7 @@ func TestServeCommandStartupErrors(t *testing.T) {
 		{
 			name:       "unparsable timeout",
 			env:        map[string]string{config.EnvTypeSafeKey: "k", config.EnvTimeout: "soon"},
-			wantStderr: []string{"jev-mcp doctor"},
+			wantStderr: []string{config.EnvTimeout, "jev-mcp doctor"},
 		},
 		{
 			name:       "all interfaces",
@@ -346,6 +346,7 @@ func TestServeCommandHTTPToken(t *testing.T) {
 		{name: "env token enforced", opts: serveOptions{}, want401: true, wantAuth: "auth=true"},
 		{name: "env token accepted", opts: serveOptions{}, authz: "Bearer env-tok", wantAuth: "auth=true"},
 		{name: "flag token overrides env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer env-tok", want401: true, wantAuth: "auth=true"},
+		{name: "flag token accepted", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer flag-tok", wantAuth: "auth=true"},
 		{name: "empty flag disables auth", opts: serveOptions{httpTokenSet: true}, wantAuth: "auth=false"},
 	}
 	for _, tt := range tests {
@@ -361,10 +362,15 @@ func TestServeCommandHTTPToken(t *testing.T) {
 				done <- serveCommand(ctx, tt.opts, env, noLookup(t), io.NopCloser(strings.NewReader("")), io.Discard, &stderr)
 			}()
 
-			status := waitForStatus(t, "http://"+addr, tt.authz)
+			status := waitForStatus(t, "http://"+addr, tt.authz, done, &stderr)
 			cancel()
-			if code := <-done; code != exitOK {
-				t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+			select {
+			case code := <-done:
+				if code != exitOK {
+					t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("serveCommand did not return after cancel (stderr: %s)", stderr.String())
 			}
 			if got401 := status == http.StatusUnauthorized; got401 != tt.want401 {
 				t.Errorf("status = %d, want401 = %v", status, tt.want401)
@@ -379,13 +385,23 @@ func TestServeCommandHTTPToken(t *testing.T) {
 	}
 }
 
-// waitForStatus posts to url until the server answers, and returns the status.
-func waitForStatus(t *testing.T, url, authz string) int {
+// waitForStatus posts to url until the server answers, and returns the
+// status. It fails at once, with the server's exit code and stderr, if the
+// server exits first, and bounds each request so a peer that accepts but never
+// answers cannot hang the test.
+func waitForStatus(t *testing.T, url, authz string, done <-chan int, stderr *syncBuffer) int {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(`{}`))
+		select {
+		case code := <-done:
+			t.Fatalf("server exited with %d before answering (stderr: %s)", code, stderr.String())
+		default:
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(`{}`))
 		if err != nil {
+			cancel()
 			t.Fatalf("new request: %v", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -395,10 +411,12 @@ func waitForStatus(t *testing.T, url, authz string) int {
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
+			cancel()
 			return resp.StatusCode
 		}
+		cancel()
 		if time.Now().After(deadline) {
-			t.Fatalf("server never answered: %v", err)
+			t.Fatalf("server never answered: %v (stderr: %s)", err, stderr.String())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

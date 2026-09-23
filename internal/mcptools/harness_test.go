@@ -3,9 +3,11 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -34,6 +36,11 @@ func connect(t *testing.T, d Deps) *mcp.ClientSession {
 	return cs
 }
 
+// errNoCannedResult is what a fakeEvaluator with neither a result nor an
+// error returns, so a call that should never reach the client fails loudly
+// instead of handing the handler a nil result.
+var errNoCannedResult = errors.New("fakeEvaluator: no canned result")
+
 // fakeEvaluator returns a canned result or error and records the request it
 // was given.
 type fakeEvaluator struct {
@@ -48,6 +55,9 @@ func (f *fakeEvaluator) Evaluate(_ context.Context, req jev.Request) (*jev.Resul
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.got = append(f.got, req)
+	if f.res == nil && f.err == nil {
+		return nil, errNoCannedResult
+	}
 	return f.res, f.err
 }
 
@@ -57,6 +67,10 @@ func (f *fakeEvaluator) requests() []jev.Request {
 	return slices.Clone(f.got)
 }
 
+// fixtureLatency is the latency resultFrom reports, nonzero so the tests can
+// tell it from an unset field.
+const fixtureLatency = 1500 * time.Millisecond
+
 // resultFrom decodes a provider response body into a Result, so Answer.Raw is
 // populated exactly as the real client populates it.
 func resultFrom(t *testing.T, body string) *jev.Result {
@@ -65,7 +79,7 @@ func resultFrom(t *testing.T, body string) *jev.Result {
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		t.Fatalf("decode response fixture: %v", err)
 	}
-	return &jev.Result{Response: resp, ProviderName: jev.ProviderTypeSafe, Attempts: 1}
+	return &jev.Result{Response: resp, ProviderName: jev.ProviderTypeSafe, Attempts: 1, Latency: fixtureLatency}
 }
 
 // callEvaluate calls jev_evaluate with args and returns the result. A protocol
