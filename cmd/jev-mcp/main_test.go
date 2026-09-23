@@ -20,7 +20,8 @@ func TestRun(t *testing.T) {
 		wantStderr string
 	}{
 		{name: "version", args: []string{"-version"}, wantCode: exitOK, wantStdout: "jev-mcp " + jevmcp.Version},
-		{name: "no command", args: nil, wantCode: exitUsage, wantStderr: "no command given"},
+		{name: "bad log level", args: []string{"-log-level", "loud"}, wantCode: exitUsage, wantStderr: "invalid value"},
+		{name: "help names both commands", args: []string{"-h"}, wantCode: exitUsage, wantStderr: "jev-mcp doctor [-probe]"},
 		{name: "unknown flag", args: []string{"-bogus"}, wantCode: exitUsage, wantStderr: "flag provided but not defined: -bogus"},
 		{name: "positional argument", args: []string{"extra"}, wantCode: exitUsage, wantStderr: `unexpected argument "extra"`},
 		// These reach doctorCommand and fail in its flag parsing, before any
@@ -96,6 +97,26 @@ func TestRunDoctorPropagatesFailure(t *testing.T) {
 	}
 	if got := stdout.String(); !strings.Contains(got, "[FAIL] providers") {
 		t.Fatalf("run(doctor) should report a provider failure:\n%s", got)
+	}
+}
+
+// TestRunServesByDefault confirms that run with no arguments starts the serve
+// command. An explicit provider with no key fails in serve's configuration
+// check before stdin is read, so the outcome is the serve error and its hint.
+// Serial: t.Setenv forbids t.Parallel.
+func TestRunServesByDefault(t *testing.T) {
+	t.Setenv(config.EnvProvider, "typesafe")
+	t.Setenv(config.EnvTypeSafeKey, "")
+
+	var stdout, stderr strings.Builder
+	if code := run(t.Context(), nil, &stdout, &stderr); code != exitError {
+		t.Fatalf("run() exit = %d, want %d (stderr: %s)", code, exitError, stderr.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "run 'jev-mcp doctor'") {
+		t.Fatalf("stderr %q does not carry the serve configuration hint", got)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want nothing", stdout.String())
 	}
 }
 

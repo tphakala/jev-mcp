@@ -1,0 +1,713 @@
+package mcptools
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/tphakala/jev-mcp/internal/jev"
+)
+
+// mixedResponse answers one question of each primitive plus one of a type this
+// server does not recognise, with unrounded numbers and a legend mixing a
+// string level and an object level.
+const mixedResponse = `{"model":"jev-1.13.0","answers":{` +
+	`"route":{"type":"choice","choice":"billing","confidence":0.87341,"probabilities":{"billing":0.87341,"tech":0.12659}},` +
+	`"severity":{"type":"score","score":1.23456,"confidence":0.6,"probabilities":{"0":0.1,"1":0.5,"2":0.4},"legend":{"0":"low","1":{"what":"medium"},"2":"high"}},` +
+	`"spam":{"type":"noul","noul":0.01234},` +
+	`"future":{"type":"rank","order":["a","b"]}},` +
+	`"usage":{"input_tokens":120,"output_tokens":4,"cost":0.00012}}`
+
+// mixedArgs asks the questions mixedResponse answers, in an order that is not
+// sorted, so the tests can tell input order from map or name order.
+func mixedArgs() map[string]any {
+	return map[string]any{
+		"state": map[string]any{"ticket": "I was charged twice"},
+		"questions": []any{
+			map[string]any{"name": "route", "type": "choice", "instructions": "which team", "criteria": map[string]any{"billing": "money", "tech": nil}},
+			map[string]any{"name": "severity", "type": "score", "instructions": "how bad", "criteria": []any{"low", map[string]any{"what": "medium"}, "high"}},
+			map[string]any{"name": "spam", "type": "noul", "instructions": "is it spam"},
+			map[string]any{"name": "future", "type": "noul", "instructions": map[string]any{"question": "anything"}},
+		},
+	}
+}
+
+// structured decodes a tool result's structured content into evaluateOutput.
+func structured(t *testing.T, res *mcp.CallToolResult) evaluateOutput {
+	t.Helper()
+	b, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out evaluateOutput
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("decode structured content: %v\n%s", err, b)
+	}
+	return out
+}
+
+// answerNames lists the names of answers in order.
+func answerNames(answers []answerOutput) []string {
+	names := make([]string, 0, len(answers))
+	for _, a := range answers {
+		names = append(names, a.Name)
+	}
+	return names
+}
+
+func TestEvaluateSummaryText(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), mixedArgs())
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+
+	// Input order, three decimals, no confidence for noul, the unknown type
+	// verbatim under raw, and nothing else (no probabilities, legend, usage).
+	const want = `{"answers":[` +
+		`{"name":"route","choice":"billing","confidence":0.873},` +
+		`{"name":"severity","score":1.235,"confidence":0.6},` +
+		`{"name":"spam","noul":0.012},` +
+		`{"name":"future","raw":{"type":"rank","order":["a","b"]}}]}`
+	if got := resultText(t, res); got != want {
+		t.Fatalf("summary text:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestEvaluateStructuredOutputIsFull(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), mixedArgs())
+	out := structured(t, res)
+
+	if out.Provider != jev.ProviderTypeSafe || out.Model != "jev-1.13.0" || out.Attempts != 1 {
+		t.Errorf("provider/model/attempts = %q/%q/%d", out.Provider, out.Model, out.Attempts)
+	}
+	if out.Usage.InputTokens != 120 || out.Usage.OutputTokens != 4 || out.Usage.Cost == nil || *out.Usage.Cost != 0.00012 {
+		t.Errorf("usage = %+v", out.Usage)
+	}
+	if out.LatencyMS != fixtureLatency.Milliseconds() {
+		t.Errorf("latency_ms = %d, want %d", out.LatencyMS, fixtureLatency.Milliseconds())
+	}
+	if names, want := answerNames(out.Answers), []string{"route", "severity", "spam", "future"}; !slices.Equal(names, want) {
+		t.Fatalf("answer order = %v, want %v", names, want)
+	}
+	assertMixedAnswers(t, out.Answers)
+}
+
+// assertMixedAnswers checks the answers decoded from mixedResponse, in input
+// order. Structured numbers are not rounded; only the summary text is.
+func assertMixedAnswers(t *testing.T, answers []answerOutput) {
+	t.Helper()
+	assertChoiceAndScore(t, &answers[0], &answers[1])
+	assertNoulAndRaw(t, answers)
+}
+
+// assertChoiceAndScore checks the route (choice) and severity (score) answers.
+func assertChoiceAndScore(t *testing.T, route, severity *answerOutput) {
+	t.Helper()
+	if route.Type != "choice" || route.Choice != "billing" || route.Confidence == nil || *route.Confidence != 0.87341 {
+		t.Errorf("route = %+v", route)
+	}
+	if route.Probabilities["tech"] != 0.12659 {
+		t.Errorf("route probabilities = %v", route.Probabilities)
+	}
+	if severity.Type != "score" || severity.Score == nil || *severity.Score != 1.23456 || severity.Confidence == nil || *severity.Confidence != 0.6 {
+		t.Errorf("severity = %+v, want score 1.23456 with confidence 0.6", severity)
+	}
+	if severity.Probabilities["1"] != 0.5 {
+		t.Errorf("severity probabilities = %v", severity.Probabilities)
+	}
+	wantLegend := map[string]any{"0": "low", "1": map[string]any{"what": "medium"}, "2": "high"}
+	if !reflect.DeepEqual(severity.Legend, wantLegend) {
+		t.Errorf("severity legend = %#v, want %#v", severity.Legend, wantLegend)
+	}
+}
+
+// assertNoulAndRaw checks the spam (noul) answer and that raw appears only on
+// the answer this server cannot read.
+func assertNoulAndRaw(t *testing.T, answers []answerOutput) {
+	t.Helper()
+	route, severity, spam, future := &answers[0], &answers[1], &answers[2], &answers[3]
+	if spam.Type != "noul" || spam.Noul == nil || *spam.Noul != 0.01234 || spam.Confidence != nil {
+		t.Errorf("spam = %+v", spam)
+	}
+	if route.Raw != nil || severity.Raw != nil || spam.Raw != nil {
+		t.Error("raw must be set only for an answer this server cannot read")
+	}
+	wantRaw := map[string]any{"type": "rank", "order": []any{"a", "b"}}
+	if future.Type != "rank" || !reflect.DeepEqual(future.Raw, wantRaw) {
+		t.Errorf("future = %+v, want type rank with raw %v", future, wantRaw)
+	}
+}
+
+func TestEvaluateFullDetailMirrorsStructured(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	args := mixedArgs()
+	args["detail"] = detailFull
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), args)
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+
+	var fromText any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &fromText); err != nil {
+		t.Fatalf("full text is not JSON: %v", err)
+	}
+	if !reflect.DeepEqual(fromText, res.StructuredContent) {
+		t.Fatalf("full text differs from structured content:\ntext %v\nstructured %v", fromText, res.StructuredContent)
+	}
+	if !strings.Contains(resultText(t, res), `"probabilities"`) {
+		t.Fatal("full text should carry probabilities")
+	}
+}
+
+func TestEvaluateRequestMapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		model     any
+		wantModel string
+	}{
+		{name: "default model", model: nil, wantModel: "jev-default"},
+		{name: "explicit model", model: "jev-1.13", wantModel: "jev-1.13"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+			args := mixedArgs()
+			if tt.model != nil {
+				args["model"] = tt.model
+			}
+			callEvaluate(t, connect(t, Deps{Client: fake, DefaultModel: "jev-default"}), args)
+
+			reqs := fake.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("got %d requests, want 1", len(reqs))
+			}
+			req := reqs[0]
+			if req.Model != tt.wantModel {
+				t.Errorf("model = %q, want %q", req.Model, tt.wantModel)
+			}
+			if got := string(req.State); got != `{"ticket":"I was charged twice"}` {
+				t.Errorf("state = %s", got)
+			}
+			if got := string(req.Questions["route"].Criteria); got != `{"billing":"money","tech":null}` {
+				t.Errorf("route criteria = %s", got)
+			}
+			if got := string(req.Questions["future"].Instructions); got != `{"question":"anything"}` {
+				t.Errorf("future instructions = %s", got)
+			}
+			// An omitted criteria must stay absent, not become the literal null.
+			if c := req.Questions["spam"].Criteria; c != nil {
+				t.Errorf("spam criteria = %s, want absent", c)
+			}
+			if got := req.Questions["severity"].Type; got != jev.TypeScore {
+				t.Errorf("severity type = %q", got)
+			}
+		})
+	}
+}
+
+// TestEvaluateSendsArgumentsVerbatim pins that the union-typed fields reach
+// Jev as the client sent them. The SDK re-marshals arguments through
+// map[string]any before the handler runs, which rounds integers above 2^53
+// and sorts object keys; the handler must not inherit that.
+func TestEvaluateSendsArgumentsVerbatim(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	const args = `{"state":{"z":1,"id":12345678901234567891,"a":1.50},` +
+		`"questions":[{"name":"route","type":"choice","instructions":{"q":"which","n":9007199254740993},` +
+		`"criteria":{"tech":null,"billing":"money"}}]}`
+	res, err := connect(t, Deps{Client: fake}).CallTool(t.Context(), &mcp.CallToolParams{Name: toolEvaluate, Arguments: json.RawMessage(args)})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	q := reqs[0].Questions["route"]
+	for _, c := range []struct{ what, got, want string }{
+		{"state", string(reqs[0].State), `{"z":1,"id":12345678901234567891,"a":1.50}`},
+		{"instructions", string(q.Instructions), `{"q":"which","n":9007199254740993}`},
+		{"criteria", string(q.Criteria), `{"tech":null,"billing":"money"}`},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %s, want %s", c.what, c.got, c.want)
+		}
+	}
+}
+
+// TestEvaluateUnreadableAndEdgeAnswers covers answers the summary cannot
+// render as a decision: a known type whose value field is malformed or
+// missing is passed through under raw in both the text and the structured
+// result, with no typed fields beside it, rather than shown as a decision with
+// no value. It also
+// pins a score with no confidence and a number too large to round.
+func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		answer   string
+		wantText string
+		wantRaw  bool
+	}{
+		{
+			name:     "choice with malformed confidence",
+			answer:   `{"type":"choice","choice":"a","confidence":"high"}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"choice","choice":"a","confidence":"high"}}]}`,
+			wantRaw:  true,
+		},
+		{
+			name:     "noul with malformed value",
+			answer:   `{"type":"noul","noul":"yes"}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"noul","noul":"yes"}}]}`,
+			wantRaw:  true,
+		},
+		{
+			name:     "score missing its value",
+			answer:   `{"type":"score","confidence":0.5,"probabilities":{"0":1},"legend":{"0":"low"}}`,
+			wantText: `{"answers":[{"name":"q","raw":{"type":"score","confidence":0.5,"probabilities":{"0":1},"legend":{"0":"low"}}}]}`,
+			wantRaw:  true,
+		},
+		{
+			// Jev sends no confidence for noul; if one arrives, neither the
+			// summary nor the structured result shows it, since the
+			// probability is its own certainty.
+			name:     "noul with an unexpected confidence",
+			answer:   `{"type":"noul","noul":0.25,"confidence":0.9}`,
+			wantText: `{"answers":[{"name":"q","noul":0.25}]}`,
+		},
+		{
+			name:     "score without confidence",
+			answer:   `{"type":"score","score":1.5}`,
+			wantText: `{"answers":[{"name":"q","score":1.5}]}`,
+		},
+		{
+			name:     "score too large to round",
+			answer:   `{"type":"score","score":1e306,"confidence":0.25}`,
+			wantText: `{"answers":[{"name":"q","score":1e+306,"confidence":0.25}]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			body := `{"model":"m","answers":{"q":` + tt.answer + `},"usage":{"input_tokens":1,"output_tokens":1}}`
+			fake := &fakeEvaluator{res: resultFrom(t, body)}
+			args := map[string]any{"state": "s", "questions": []any{
+				map[string]any{"name": "q", "type": "noul", "instructions": "q"},
+			}}
+			res := callEvaluate(t, connect(t, Deps{Client: fake}), args)
+			if res.IsError {
+				t.Fatalf("tool error: %s", resultText(t, res))
+			}
+			if got := resultText(t, res); got != tt.wantText {
+				t.Errorf("summary text:\n got %s\nwant %s", got, tt.wantText)
+			}
+			out := structured(t, res)
+			if len(out.Answers) != 1 {
+				t.Fatalf("got %d answers, want 1", len(out.Answers))
+			}
+			a := out.Answers[0]
+			if gotRaw := a.Raw != nil; gotRaw != tt.wantRaw {
+				t.Errorf("structured raw present = %v, want %v", gotRaw, tt.wantRaw)
+			}
+			typed := a.Choice != "" || a.Score != nil || a.Noul != nil || a.Confidence != nil || a.Probabilities != nil || a.Legend != nil
+			if tt.wantRaw && typed {
+				t.Errorf("unreadable answer carries typed fields beside raw: %+v", a)
+			}
+			if a.Type == string(jev.TypeNoul) && a.Confidence != nil {
+				t.Errorf("noul answer carries a confidence in the structured result: %v", *a.Confidence)
+			}
+		})
+	}
+}
+
+// TestEvaluateAcceptsNullNoulCriteria pins that a noul question may pass
+// criteria as null, and that null is treated as omitted: it is not sent to
+// Jev, whose wire form for an absent criteria is no key at all.
+func TestEvaluateAcceptsNullNoulCriteria(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), map[string]any{
+		"state":     "s",
+		"questions": []any{map[string]any{"name": "spam", "type": "noul", "instructions": "q", "criteria": nil}},
+	})
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	if c := reqs[0].Questions["spam"].Criteria; c != nil {
+		t.Fatalf("criteria = %q, want absent", c)
+	}
+}
+
+// TestEvaluateLogsWithoutContent pins the log contract: one record per call
+// that reaches the client, success at Info and failure at Warn, and never the
+// state or instructions text.
+func TestEvaluateLogsWithoutContent(t *testing.T) {
+	t.Parallel()
+
+	const markerState, markerInstr = "state-marker-7f3a", "instr-marker-9c1e"
+	args := map[string]any{"state": markerState, "questions": []any{
+		map[string]any{"name": "q", "type": "noul", "instructions": markerInstr},
+	}}
+	// A result whose legend is not valid JSON cannot occur from a real
+	// decode, but it is one way to make rendering fail after the client
+	// has answered, which must be logged as a failure, not a success.
+	unrenderable := &jev.Result{Model: "m", Answers: map[string]jev.Answer{
+		"q": {Type: jev.TypeScore, Score: new(1.0), Legend: map[string]json.RawMessage{"0": json.RawMessage("{")}},
+	}}
+	tests := []struct {
+		name      string
+		fake      *fakeEvaluator
+		wantMsg   string
+		wantLevel string
+	}{
+		{name: "success", fake: &fakeEvaluator{res: resultFrom(t, mixedResponse)}, wantMsg: logMsgEvaluated, wantLevel: "level=INFO"},
+		{name: "client failure", fake: &fakeEvaluator{err: errors.New("provider down")}, wantMsg: logMsgFailed, wantLevel: "level=WARN"},
+		{name: "render failure", fake: &fakeEvaluator{res: unrenderable}, wantMsg: logMsgFailed, wantLevel: "level=WARN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var logs strings.Builder
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			callEvaluate(t, connect(t, Deps{Client: tt.fake, Logger: logger}), args)
+			got := logs.String()
+			if strings.Count(got, "msg=") != 1 || !strings.Contains(got, tt.wantMsg) || !strings.Contains(got, tt.wantLevel) {
+				t.Errorf("logs = %q, want exactly one %s %q record", got, tt.wantLevel, tt.wantMsg)
+			}
+			for _, marker := range []string{markerState, markerInstr} {
+				if strings.Contains(got, marker) {
+					t.Errorf("logs contain request content %q: %s", marker, got)
+				}
+			}
+		})
+	}
+}
+
+// TestEvaluateDuplicateQuestionsKey pins that a repeated questions key cannot
+// merge fields from the first copy into the second. The SDK validates only
+// the last copy, so a criteria it never saw must not reach Jev.
+func TestEvaluateDuplicateQuestionsKey(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	const args = `{"state":"s",` +
+		`"questions":[{"name":"a","type":"choice","instructions":"i","criteria":"NOT-VALIDATED"}],` +
+		`"questions":[{"name":"b","type":"noul","instructions":"i"}]}`
+	res, err := connect(t, Deps{Client: fake}).CallTool(t.Context(), &mcp.CallToolParams{Name: toolEvaluate, Arguments: json.RawMessage(args)})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	if c := reqs[0].Questions["b"].Criteria; c != nil {
+		t.Fatalf("question b criteria = %s, want absent (leaked from the first questions key)", c)
+	}
+}
+
+// TestRawEnvelopeMirrorsSchemaInput guards the two views of the tool input
+// against drift: every JSON field the schema advertises (evaluateInput,
+// questionInput) must be decoded by the handler (rawEnvelope, rawQuestion),
+// and the other way round.
+func TestRawEnvelopeMirrorsSchemaInput(t *testing.T) {
+	t.Parallel()
+
+	jsonNames := func(v any) []string {
+		rt := reflect.TypeOf(v)
+		names := make([]string, 0, rt.NumField())
+		for f := range rt.Fields() {
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	for _, c := range []struct {
+		what         string
+		schema, read any
+	}{
+		{"call", evaluateInput{}, rawEnvelope{}},
+		{"question", questionInput{}, rawQuestion{}},
+	} {
+		if got, want := jsonNames(c.read), jsonNames(c.schema); !slices.Equal(got, want) {
+			t.Errorf("%s fields decoded %v, schema advertises %v", c.what, got, want)
+		}
+	}
+}
+
+// TestEvaluateOrdersAnswers pins the answer order when the provider's answers
+// do not match the questions: a missing answer is left out, and an answer for
+// a name that was not asked follows the asked ones in name order.
+func TestEvaluateOrdersAnswers(t *testing.T) {
+	t.Parallel()
+
+	// Five unasked answers, so an accidentally sorted map iteration passes a
+	// test without the sort at most 1 time in 120.
+	const body = `{"model":"m","answers":{` +
+		`"zeta":{"type":"noul","noul":0.5},` +
+		`"e":{"type":"noul","noul":0.5},"d":{"type":"noul","noul":0.4},"c":{"type":"noul","noul":0.3},` +
+		`"b":{"type":"noul","noul":0.1},"a":{"type":"noul","noul":0.2}},"usage":{"input_tokens":1,"output_tokens":1}}`
+	fake := &fakeEvaluator{res: resultFrom(t, body)}
+	args := map[string]any{
+		"state": "s",
+		"questions": []any{
+			map[string]any{"name": "zeta", "type": "noul", "instructions": "q"},
+			map[string]any{"name": "missing", "type": "noul", "instructions": "q"},
+		},
+	}
+	res := callEvaluate(t, connect(t, Deps{Client: fake}), args)
+	if names, want := answerNames(structured(t, res).Answers), []string{"zeta", "a", "b", "c", "d", "e"}; !slices.Equal(names, want) {
+		t.Fatalf("answer order = %v, want %v", names, want)
+	}
+	const wantText = `{"answers":[{"name":"zeta","noul":0.5},{"name":"a","noul":0.2},{"name":"b","noul":0.1},` +
+		`{"name":"c","noul":0.3},{"name":"d","noul":0.4},{"name":"e","noul":0.5}]}`
+	if got := resultText(t, res); got != wantText {
+		t.Fatalf("summary text = %s, want %s", got, wantText)
+	}
+}
+
+func TestEvaluateToolErrors(t *testing.T) {
+	t.Parallel()
+
+	// A real client: validation runs inside Evaluate before any network call,
+	// so the unreachable base URL is never dialled.
+	realClient, err := jev.New([]jev.Provider{{
+		Name: jev.ProviderTypeSafe, BaseURL: "http://127.0.0.1:1", Path: jev.SystemOnePath, APIKey: "k",
+	}})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	apiErr := &jev.APIError{Provider: jev.ProviderTypeSafe, Status: 422, Message: "criteria rejected", Sentinel: jev.ErrInvalidRequest}
+
+	noul := func(name string) map[string]any {
+		return map[string]any{"name": name, "type": "noul", "instructions": "q"}
+	}
+	tests := []struct {
+		name     string
+		client   Evaluator
+		args     map[string]any
+		wantText []string
+		// rejected marks input the server must refuse before calling the
+		// client; the fake then must have seen no request.
+		rejected bool
+	}{
+		{
+			name:     "duplicate question name",
+			client:   &fakeEvaluator{},
+			rejected: true,
+			args:     map[string]any{"state": "s", "questions": []any{noul("same"), noul("same")}},
+			wantText: []string{`"same"`, "more than once"},
+		},
+		{
+			name:     "invalid detail",
+			client:   &fakeEvaluator{},
+			rejected: true,
+			args:     map[string]any{"state": "s", "questions": []any{noul("q")}, "detail": "verbose"},
+			wantText: []string{"detail"},
+		},
+		{
+			name:     "missing questions",
+			client:   &fakeEvaluator{},
+			rejected: true,
+			args:     map[string]any{"state": "s"},
+			wantText: []string{"questions"},
+		},
+		{
+			name:     "null questions",
+			client:   &fakeEvaluator{},
+			rejected: true,
+			args:     map[string]any{"state": "s", "questions": nil},
+			wantText: []string{"questions"},
+		},
+		{
+			name:     "null state",
+			client:   &fakeEvaluator{},
+			rejected: true,
+			args:     map[string]any{"state": nil, "questions": []any{noul("q")}},
+			wantText: []string{"state"},
+		},
+		{
+			name:   "validation names the question",
+			client: realClient,
+			args: map[string]any{"state": "s", "questions": []any{
+				map[string]any{"name": "pick", "type": "choice", "instructions": "q", "criteria": map[string]any{"only": "one"}},
+			}},
+			wantText: []string{`"pick"`, "options"},
+		},
+		{
+			name:     "provider rejection",
+			client:   &fakeEvaluator{err: apiErr},
+			args:     map[string]any{"state": "s", "questions": []any{noul("q")}},
+			wantText: []string{"criteria rejected", "422"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := callEvaluate(t, connect(t, Deps{Client: tt.client}), tt.args)
+			if !res.IsError {
+				t.Fatalf("want a tool error, got success: %v", res.StructuredContent)
+			}
+			if fake, ok := tt.client.(*fakeEvaluator); ok && tt.rejected {
+				if n := len(fake.requests()); n != 0 {
+					t.Errorf("the client saw %d requests, want the input rejected before it", n)
+				}
+			}
+			text := resultText(t, res)
+			for _, want := range tt.wantText {
+				if !strings.Contains(text, want) {
+					t.Errorf("error text %q does not contain %q", text, want)
+				}
+			}
+		})
+	}
+}
+
+// TestToRequestRejectsInvalidDetail covers the handler's own detail check,
+// which the schema enum normally shadows, so it stays correct if the schema
+// is ever loosened.
+func TestToRequestRejectsInvalidDetail(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := Deps{}.toRequest(&rawInput{State: json.RawMessage(`"s"`), Detail: "verbose"})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("err = %v, want ErrInvalidInput", err)
+	}
+}
+
+// TestDescriptionsQuoteJevLimits pins that every description quoting a limit
+// is built from the jev constant, so a changed limit cannot leave the text
+// stale.
+func TestDescriptionsQuoteJevLimits(t *testing.T) {
+	t.Parallel()
+
+	s := evaluateInputSchema()
+	q := s.Properties["questions"].Items.Properties
+	checks := []struct{ what, desc, want string }{
+		{"questions", s.Properties["questions"].Description, fmt.Sprintf("1 to %d per call", jev.MaxQuestions)},
+		{"name", q["name"].Description, fmt.Sprintf("at most %d bytes", jev.MaxQuestionNameBytes)},
+		{"criteria", q["criteria"].Description, fmt.Sprintf("%d to %d options", jev.MinChoiceOptions, jev.MaxChoiceOptions)},
+		{"criteria", q["criteria"].Description, fmt.Sprintf("%d to %d level descriptions", jev.MinScoreLevels, jev.MaxScoreLevels)},
+		{"tool", evaluateDescription, fmt.Sprintf("%d to %d levels", jev.MinScoreLevels, jev.MaxScoreLevels)},
+	}
+	for _, c := range checks {
+		if !strings.Contains(c.desc, c.want) {
+			t.Errorf("%s description %q does not quote %q", c.what, c.desc, c.want)
+		}
+	}
+}
+
+// TestEvaluateInputSchema pins what the derived schema cannot express on its
+// own: explicit JSON types for the union-typed fields (an interface field is
+// otherwise rendered with no type), the enums, and the question bounds.
+func TestEvaluateInputSchema(t *testing.T) {
+	t.Parallel()
+
+	tools := listRegisteredTools(t)
+	i := slices.IndexFunc(tools, func(tool *mcp.Tool) bool { return tool.Name == toolEvaluate })
+	if i < 0 {
+		t.Fatalf("%s is not registered", toolEvaluate)
+	}
+	b, err := json.Marshal(tools[i].InputSchema)
+	if err != nil {
+		t.Fatalf("marshal schema: %v", err)
+	}
+	var s struct {
+		Required   []string `json:"required"`
+		Properties struct {
+			State struct {
+				Type []string `json:"type"`
+			} `json:"state"`
+			Detail struct {
+				Enum []string `json:"enum"`
+			} `json:"detail"`
+			Questions struct {
+				Type     string `json:"type"`
+				MinItems int    `json:"minItems"`
+				MaxItems int    `json:"maxItems"`
+				Items    struct {
+					Required   []string `json:"required"`
+					Properties struct {
+						Name struct {
+							MinLength int `json:"minLength"`
+							MaxLength int `json:"maxLength"`
+						} `json:"name"`
+						Type struct {
+							Enum []string `json:"enum"`
+						} `json:"type"`
+						Instructions struct {
+							Type []string `json:"type"`
+						} `json:"instructions"`
+						Criteria struct {
+							Type []string `json:"type"`
+						} `json:"criteria"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"questions"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatalf("decode schema: %v\n%s", err, b)
+	}
+	p := s.Properties
+	q := p.Questions.Items.Properties
+	checks := []struct {
+		what      string
+		got, want []string
+	}{
+		{"required", s.Required, []string{"questions", "state"}},
+		{"state type", p.State.Type, []string{"array", "object", "string"}},
+		{"detail enum", p.Detail.Enum, []string{"full", "summary"}},
+		{"question required", p.Questions.Items.Required, []string{"instructions", "name", "type"}},
+		{"question type enum", q.Type.Enum, []string{"choice", "noul", "score"}},
+		{"instructions type", q.Instructions.Type, []string{"array", "object", "string"}},
+		{"criteria type", q.Criteria.Type, []string{"array", "null", "object"}},
+	}
+	for _, c := range checks {
+		got := slices.Sorted(slices.Values(c.got))
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s = %v, want %v", c.what, got, c.want)
+		}
+	}
+	if p.Questions.Type != "array" {
+		t.Errorf("questions type = %q, want array (not nullable)", p.Questions.Type)
+	}
+	if p.Questions.MinItems != 1 || p.Questions.MaxItems != jev.MaxQuestions {
+		t.Errorf("questions items bounds = %d..%d, want 1..%d", p.Questions.MinItems, p.Questions.MaxItems, jev.MaxQuestions)
+	}
+	if q.Name.MinLength != 1 || q.Name.MaxLength != jev.MaxQuestionNameBytes {
+		t.Errorf("name length bounds = %d..%d", q.Name.MinLength, q.Name.MaxLength)
+	}
+}
