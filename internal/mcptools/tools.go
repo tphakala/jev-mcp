@@ -187,9 +187,37 @@ func evaluateInputSchema() *jsonschema.Schema {
 	return s
 }
 
-// evaluate is the jev_evaluate handler.
-func (d Deps) evaluate(ctx context.Context, _ *mcp.CallToolRequest, in evaluateInput) (*mcp.CallToolResult, evaluateOutput, error) {
-	detail, req, err := d.toRequest(in)
+// rawQuestion and rawInput mirror questionInput and evaluateInput with the
+// union-typed fields kept as raw JSON. The SDK decodes the arguments into a
+// map[string]any and marshals them again before validating them (go-sdk
+// v1.8.0 mcp/tool.go applySchema), which turns every JSON number into a
+// float64 and re-sorts object keys, so an integer above 2^53 in state would
+// reach Jev rounded. The handler therefore builds the request from the
+// arguments as the client sent them (CallToolParamsRaw.Arguments), after the
+// SDK has validated them against the input schema.
+type rawQuestion struct {
+	Name         string          `json:"name"`
+	Type         string          `json:"type"`
+	Instructions json.RawMessage `json:"instructions"`
+	Criteria     json.RawMessage `json:"criteria,omitempty"`
+}
+
+type rawInput struct {
+	State     json.RawMessage `json:"state"`
+	Questions []rawQuestion   `json:"questions"`
+	Model     string          `json:"model,omitempty"`
+	Detail    string          `json:"detail,omitempty"`
+}
+
+// evaluate is the jev_evaluate handler. The typed input exists for the SDK's
+// schema validation; the request is built from the raw arguments (see
+// rawInput).
+func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluateInput) (*mcp.CallToolResult, evaluateOutput, error) {
+	var in rawInput
+	if err := json.Unmarshal(call.Params.Arguments, &in); err != nil {
+		return nil, evaluateOutput{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
+	}
+	detail, req, err := d.toRequest(&in)
 	if err != nil {
 		return nil, evaluateOutput{}, err
 	}
@@ -227,7 +255,7 @@ func (d Deps) evaluate(ctx context.Context, _ *mcp.CallToolRequest, in evaluateI
 // toRequest checks the input the schema cannot express and builds the Jev
 // request. The per-question rules live in jev.Validate, which Client.Evaluate
 // runs, so they are not repeated here.
-func (d Deps) toRequest(in evaluateInput) (string, jev.Request, error) {
+func (d Deps) toRequest(in *rawInput) (string, jev.Request, error) {
 	detail := in.Detail
 	switch detail {
 	case "":
@@ -237,48 +265,26 @@ func (d Deps) toRequest(in evaluateInput) (string, jev.Request, error) {
 		return "", jev.Request{}, fmt.Errorf("%w: detail must be %s or %s, got %q", ErrInvalidInput, detailSummary, detailFull, detail)
 	}
 
-	state, err := marshalAny(in.State)
-	if err != nil {
-		return "", jev.Request{}, fmt.Errorf("%w: state: %w", ErrInvalidInput, err)
-	}
 	req := jev.Request{
 		Model:     cmp.Or(in.Model, d.DefaultModel),
-		State:     state,
+		State:     in.State,
 		Questions: make(map[string]jev.Question, len(in.Questions)),
 	}
 	for _, q := range in.Questions {
 		if _, dup := req.Questions[q.Name]; dup {
 			return "", jev.Request{}, fmt.Errorf("%w: question name %q is used more than once", ErrInvalidInput, q.Name)
 		}
-		instructions, err := marshalAny(q.Instructions)
-		if err != nil {
-			return "", jev.Request{}, fmt.Errorf("%w: question %q instructions: %w", ErrInvalidInput, q.Name, err)
-		}
-		criteria, err := marshalAny(q.Criteria)
-		if err != nil {
-			return "", jev.Request{}, fmt.Errorf("%w: question %q criteria: %w", ErrInvalidInput, q.Name, err)
-		}
 		req.Questions[q.Name] = jev.Question{
 			Type:         jev.QuestionType(q.Type),
-			Instructions: instructions,
-			Criteria:     criteria,
+			Instructions: q.Instructions,
+			Criteria:     q.Criteria,
 		}
 	}
 	return detail, req, nil
 }
 
-// marshalAny encodes a decoded JSON value back to raw JSON. An absent value
-// stays empty rather than becoming the literal null, so jev.Validate reports a
-// missing field as missing and an omitted criteria is not sent.
-func marshalAny(v any) (json.RawMessage, error) {
-	if v == nil {
-		return nil, nil
-	}
-	return json.Marshal(v)
-}
-
 // questionNames returns the question names in input order.
-func questionNames(qs []questionInput) []string {
+func questionNames(qs []rawQuestion) []string {
 	names := make([]string, len(qs))
 	for i, q := range qs {
 		names[i] = q.Name

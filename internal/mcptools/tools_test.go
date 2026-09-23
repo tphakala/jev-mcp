@@ -200,6 +200,40 @@ func TestEvaluateRequestMapping(t *testing.T) {
 	}
 }
 
+// TestEvaluateSendsArgumentsVerbatim pins that the union-typed fields reach
+// Jev as the client sent them. The SDK re-marshals arguments through
+// map[string]any before the handler runs, which rounds integers above 2^53
+// and sorts object keys; the handler must not inherit that.
+func TestEvaluateSendsArgumentsVerbatim(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	const args = `{"state":{"z":1,"id":12345678901234567891,"a":1.50},` +
+		`"questions":[{"name":"route","type":"choice","instructions":{"q":"which","n":9007199254740993},` +
+		`"criteria":{"tech":null,"billing":"money"}}]}`
+	res, err := connect(t, Deps{Client: fake}).CallTool(t.Context(), &mcp.CallToolParams{Name: toolEvaluate, Arguments: json.RawMessage(args)})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	q := reqs[0].Questions["route"]
+	for _, c := range []struct{ what, got, want string }{
+		{"state", string(reqs[0].State), `{"z":1,"id":12345678901234567891,"a":1.50}`},
+		{"instructions", string(q.Instructions), `{"q":"which","n":9007199254740993}`},
+		{"criteria", string(q.Criteria), `{"tech":null,"billing":"money"}`},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %s, want %s", c.what, c.got, c.want)
+		}
+	}
+}
+
 // TestEvaluateOrdersAnswers pins the answer order when the provider's answers
 // do not match the questions: a missing answer is left out, and an answer for
 // a name that was not asked follows the asked ones in name order.
@@ -312,7 +346,7 @@ func TestEvaluateToolErrors(t *testing.T) {
 func TestToRequestRejectsInvalidDetail(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := Deps{}.toRequest(evaluateInput{State: "s", Detail: "verbose"})
+	_, _, err := Deps{}.toRequest(&rawInput{State: json.RawMessage(`"s"`), Detail: "verbose"})
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("err = %v, want ErrInvalidInput", err)
 	}
