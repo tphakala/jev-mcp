@@ -381,17 +381,19 @@ func TestResolveParseErrorAttributesDefaultPerSetting(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		env, source string
-		wantErr     error
+		env, value, source string
+		wantErr            error
 	}{
-		{config.EnvTimeout, config.SourceTimeout, config.ErrInvalidTimeout},
-		{config.EnvMaxRetries, config.SourceMaxRetries, config.ErrInvalidMaxRetries},
-		{config.EnvFallback, config.SourceFallback, config.ErrInvalidFallback},
+		{config.EnvTimeout, "nope", config.SourceTimeout, config.ErrInvalidTimeout},
+		{config.EnvTimeout, "0s", config.SourceTimeout, config.ErrInvalidTimeout},
+		{config.EnvMaxRetries, "nope", config.SourceMaxRetries, config.ErrInvalidMaxRetries},
+		{config.EnvMaxRetries, "-1", config.SourceMaxRetries, config.ErrInvalidMaxRetries},
+		{config.EnvFallback, "nope", config.SourceFallback, config.ErrInvalidFallback},
 	}
 	for _, tt := range tests {
-		t.Run(tt.env, func(t *testing.T) {
+		t.Run(tt.env+"="+tt.value, func(t *testing.T) {
 			t.Parallel()
-			cfg, err := config.Resolve(getenvFrom(map[string]string{tt.env: "nope"}))
+			cfg, err := config.Resolve(getenvFrom(map[string]string{tt.env: tt.value}))
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
@@ -575,6 +577,24 @@ func TestNormalizeSecrets(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// TestNormalizeSecretsNeverEchoTheValue checks that a rejected secret does not
+// appear in the error, which serve prints to stderr.
+func TestNormalizeSecretsNeverEchoTheValue(t *testing.T) {
+	t.Parallel()
+
+	for _, fn := range []func(string) (string, error){config.NormalizeHTTPToken, config.NormalizeAPIKey} {
+		for _, in := range []string{"SENTINEL-\x7f", "SENTINEL\x00"} {
+			_, err := fn(in)
+			if err == nil {
+				t.Fatalf("(%q) returned no error", in)
+			}
+			if strings.Contains(err.Error(), "SENTINEL") {
+				t.Errorf("error %q echoes the value", err)
+			}
 		}
 	}
 }

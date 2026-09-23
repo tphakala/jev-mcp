@@ -141,16 +141,18 @@ var (
 	// breaks. It never includes the value.
 	ErrBlankHTTPToken = errors.New("config: HTTP bearer token is only whitespace")
 	// ErrInvalidHTTPToken is returned by [NormalizeHTTPToken] for an HTTP bearer
-	// token that holds a control character (other than tab) after trimming, which
-	// no client can send in a header. It never includes the value.
+	// token that holds an ASCII control character (other than tab) after
+	// trimming, which net/http rejects in a received header, so no request
+	// could present it. It never includes the value.
 	ErrInvalidHTTPToken = errors.New("config: HTTP bearer token contains a control character")
 	// ErrBlankAPIKey is returned by [NormalizeAPIKey], and so by [Select], for an
 	// API key that is set but holds only spaces, tabs, and line breaks. It never
 	// includes the value.
 	ErrBlankAPIKey = errors.New("config: API key is only whitespace")
 	// ErrInvalidAPIKey is returned by [NormalizeAPIKey], and so by [Select], for
-	// an API key that holds a control character (other than tab) after trimming,
-	// which cannot be sent in a header. It never includes the value.
+	// an API key that holds an ASCII control character (other than tab) after
+	// trimming, which net/http refuses to send in a header. It never includes
+	// the value.
 	ErrInvalidAPIKey = errors.New("config: API key contains a control character")
 )
 
@@ -326,9 +328,11 @@ func resolveFallback(cfg *Config, getenv func(string) string) error {
 }
 
 // NormalizeHTTPToken prepares an HTTP bearer token for use. It trims spaces,
-// tabs, CR, and LF from both ends with [textproto.TrimString], the same
-// characters net/http strips from a received header value, so a token pasted
-// with a trailing space or newline still matches what a client can send. An
+// tabs, CR, and LF from both ends with [textproto.TrimString]: the space and
+// tab net/http strips from a received header value (net/textproto reader.go
+// trim, Go 1.27.1), plus CR and LF, which end a header line and so cannot be
+// part of a value. A token pasted with a trailing space or newline therefore
+// still matches what a client can send. An
 // empty value stays empty, meaning no authentication. A value that is non-empty
 // but only those characters returns [ErrBlankHTTPToken] rather than an empty
 // token, so a configured token never turns into "no authentication", and one

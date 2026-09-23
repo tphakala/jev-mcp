@@ -412,7 +412,7 @@ func TestRunAPIKeyNormalized(t *testing.T) {
 			wantCode: 1,
 			want: []string{
 				"[FAIL] providers", "openrouter_key=invalid",
-				"[WARN] credential format: " + config.EnvOpenRouterKey + " has a control character",
+				"[WARN] credential format: " + config.EnvOpenRouterKey + " has a control character that cannot be sent in a header",
 			},
 		},
 		{
@@ -422,7 +422,7 @@ func TestRunAPIKeyNormalized(t *testing.T) {
 				config.EnvOpenRouterKey: "or\x01key",
 				config.EnvFallback:      "false",
 			},
-			want:     []string{"[PASS] providers", "[WARN] credential format: " + config.EnvOpenRouterKey + " has a control character"},
+			want:     []string{"[PASS] providers", "[WARN] credential format: " + config.EnvOpenRouterKey + " has a control character that cannot be sent in a header"},
 			dontWant: []string{"[FAIL]"},
 		},
 	}
@@ -541,7 +541,8 @@ func TestRunProbeInterrupted(t *testing.T) {
 
 // TestRunProbeRealClient drives the default client factory (a nil factory)
 // against a local server standing in for TypeSafe, so the real client
-// construction and the probe request are exercised without a network call.
+// construction and the probe request are exercised without reaching a real
+// provider.
 func TestRunProbeRealClient(t *testing.T) {
 	t.Parallel()
 
@@ -567,5 +568,49 @@ func TestRunProbeRealClient(t *testing.T) {
 	}
 	if !strings.Contains(got, "[PASS] probe "+jev.ProviderTypeSafe+": model=jev-1.13.0") {
 		t.Errorf("want a passing probe through the real client\n%s", got)
+	}
+}
+
+// TestRunInterruptedWithoutProbeExplainsTheExit checks that a run cancelled
+// with -probe off still prints why it exits 1, instead of only PASS lines.
+func TestRunInterruptedWithoutProbeExplainsTheExit(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var out strings.Builder
+	code := doctor.Run(ctx, &out, getenvFrom(map[string]string{config.EnvTypeSafeKey: "ts-key"}), false, nil)
+
+	got := out.String()
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1\n%s", code, got)
+	}
+	if !strings.Contains(got, "[SKIP] run: interrupted") {
+		t.Errorf("want a SKIP run line explaining the exit\n%s", got)
+	}
+	if strings.Contains(got, "[FAIL]") {
+		t.Errorf("an interruption must not read as a failure\n%s", got)
+	}
+}
+
+// TestRunProbeCleansProviderValues checks that the model and id a provider
+// returns cannot carry a control sequence onto the PASS line.
+func TestRunProbeCleansProviderValues(t *testing.T) {
+	t.Parallel()
+
+	res := &jev.Result{Latency: time.Millisecond}
+	res.Model = "jev\x1b[31m-1"
+	res.ID = "id\x1b[2J"
+	ev := &fakeEvaluator{res: res}
+
+	var out strings.Builder
+	doctor.Run(t.Context(), &out, getenvFrom(map[string]string{config.EnvTypeSafeKey: "ts-key"}), true, factoryReturning(ev))
+
+	got := out.String()
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("an escape reached the report: %q", got)
+	}
+	if !strings.Contains(got, "model=jev [31m-1") || !strings.Contains(got, "id=id [2J") {
+		t.Errorf("want the model and id shown with the escape replaced\n%s", got)
 	}
 }

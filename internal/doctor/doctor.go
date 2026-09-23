@@ -42,12 +42,14 @@ type Evaluator interface {
 }
 
 // ClientFactory builds an Evaluator for one provider. Run uses it only for
-// -probe; a nil factory means the real per-provider client.
+// -probe; a nil factory means the real per-provider client. The probes run
+// concurrently, so Run may call the factory, and the Evaluators it returns,
+// from several goroutines at once, once per provider.
 type ClientFactory func(p jev.Provider) (Evaluator, error)
 
 // status is a check outcome. FAIL sets a non-zero exit; WARN does not. SKIP
-// marks a probe that did not run to completion because the run was
-// interrupted; Run exits non-zero for an interrupted run regardless.
+// marks a probe, or the run as a whole, that was interrupted before it
+// finished; Run exits non-zero for an interrupted run regardless.
 type status string
 
 const (
@@ -69,9 +71,9 @@ type check struct {
 // it makes one live decision call per configured provider. newClient is
 // injected for tests; pass nil for the real client. The probes run
 // concurrently and are reported in provider order. Run returns the process
-// exit code: 1 if any check failed or ctx was cancelled (an interrupted probe
-// is reported as SKIP, not as a failure of the provider), 0 otherwise (a
-// warning does not fail). A usage error (a bad flag) is the caller's concern,
+// exit code: 1 if any check failed or ctx was cancelled (an interrupted run
+// is reported with a SKIP line, not as a failure of a provider), 0 otherwise
+// (a warning does not fail). A usage error (a bad flag) is the caller's concern,
 // not Run's.
 func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe bool, newClient ClientFactory) int {
 	cfg, cfgErr := config.Resolve(getenv)
@@ -106,8 +108,14 @@ func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe b
 		checks = append(checks, probeChecks(ctx, providers, cfg.DefaultModel, newClient)...)
 	}
 
+	// One snapshot decides both the explaining line and the exit code, so an
+	// interrupted run never exits 1 with only PASS lines printed.
+	interrupted := ctx.Err() != nil
+	if interrupted {
+		checks = append(checks, check{statusSkip, "run", "interrupted before the checks finished"})
+	}
 	code := report(out, checks)
-	if ctx.Err() != nil {
+	if interrupted {
 		return 1
 	}
 	return code
@@ -324,10 +332,12 @@ func probeCheck(ctx context.Context, p *jev.Provider, model string, newClient Cl
 		}
 		return check{statusFail, name, probeErrorDetail(err)}
 	}
+	// The model and id come from the provider's response body, so they are
+	// cleaned before they reach the terminal.
 	detail := fmt.Sprintf("model=%s latency=%s tokens=%d/%d",
-		res.Model, res.Latency.Round(time.Millisecond), res.Usage.InputTokens, res.Usage.OutputTokens)
-	if res.ID != "" {
-		detail += " id=" + res.ID
+		jev.CleanText(res.Model), res.Latency.Round(time.Millisecond), res.Usage.InputTokens, res.Usage.OutputTokens)
+	if id := jev.CleanText(res.ID); id != "" {
+		detail += " id=" + id
 	}
 	return check{statusPass, name, detail}
 }

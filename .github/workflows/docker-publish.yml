@@ -4,7 +4,8 @@ name: Docker publish
 # image is tagged with the full semver, the major.minor, and latest. latest is
 # not listed below: metadata-action's default flavor (latest=auto) adds it for a
 # type=semver tag that is not a prerelease (procSemver in src/meta.ts at the
-# pinned v6.2.0 commit), so a prerelease tag does not move latest.
+# pinned v6.2.0 commit). A prerelease tag gets only its full version: no
+# major.minor and no latest.
 #
 # Actions in this workflow are pinned by commit SHA (with the version in a
 # comment, which Dependabot keeps updated) because the job holds packages:

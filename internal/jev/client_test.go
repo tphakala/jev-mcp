@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -463,6 +462,8 @@ func TestExtractMessage(t *testing.T) {
 	t.Parallel()
 
 	long := strings.Repeat("x", maxMessageBytes+100)
+	// A Persian word with a zero-width non-joiner, then an emoji ZWJ sequence.
+	const joined = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \U0001F468\u200d\U0001F469"
 	cases := []struct {
 		name, body, want string
 	}{
@@ -496,6 +497,22 @@ func TestExtractMessage(t *testing.T) {
 		{"C1 control in a field", `{"message":"a\u0085b"}`, "a b"},
 		{"raw body control characters", "bad\x1b[2Jgateway\x00", "bad [2Jgateway"},
 		{"raw body invalid UTF-8 run becomes one U+FFFD", "bad \xff\xfe gateway", "bad \uFFFD gateway"},
+		// A field that is empty once cleaned does not hide the next one.
+		{"control-only field falls through", `{"error":"\u0000","detail":{"message":"real reason"}}`, "real reason"},
+		{"blank message with a type falls through", `{"detail":{"error_type":"x","message":" "},"message":"m"}`, "m"},
+		{"control message with a type falls through", `{"detail":{"error_type":"x","message":"\u0007"},"message":"m"}`, "m"},
+		{"non-string error_type is ignored", `{"detail":{"error_type":404,"message":"Not found"}}`, "Not found"},
+		{"object error_type is ignored", `{"detail":{"error_type":{"a":1},"message":"Not found"}}`, "Not found"},
+		{"error_type blank once cleaned is not a prefix", `{"detail":{"error_type":"\u0007","message":"m"}}`, "m"},
+		// Padding cannot push the text out of the cap.
+		{"padded field", `{"message":"` + strings.Repeat(" ", 600) + `real"}`, "real"},
+		{"raw body padded with NUL", strings.Repeat("\x00", 600) + "real", "real"},
+		// Unicode line separators and bidi controls are replaced; joiners stay.
+		{"separators and bidi controls", `{"message":"a\u2028b\u202ec\u2066d\u2029e\u200ff"}`, "a b c d e f"},
+		{"zero-width joiners kept", `{"message":"` + joined + `"}`, joined},
+		{"prefixed message cut at a space is trimmed", `{"detail":{"error_type":"t","message":"` + strings.Repeat("x", maxMessageBytes-4) + ` y"}}`, "t: " + strings.Repeat("x", maxMessageBytes-4)},
+		// Invalid bytes at the cut become U+FFFD instead of eating valid text.
+		{"raw body of continuation bytes at the cut", "ab" + strings.Repeat("\x80", 600), "ab\uFFFD"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -507,25 +524,64 @@ func TestExtractMessage(t *testing.T) {
 	}
 }
 
-// TestCleanMessageStaysWithinCap checks that replacing invalid bytes with the
-// three-byte U+FFFD cannot push a message past the cap, and that the result is
-// valid UTF-8 without control characters.
-func TestCleanMessageStaysWithinCap(t *testing.T) {
+// TestCleanTextStaysWithinCap checks that replacing invalid bytes with the
+// three-byte U+FFFD cannot push a text past the cap.
+func TestCleanTextStaysWithinCap(t *testing.T) {
 	t.Parallel()
 
-	body := bytes.Repeat([]byte{0xff, 0x1b}, maxMessageBytes)
-	got := cleanMessage(body)
+	got := CleanText(strings.Repeat("\xff\x1b", maxMessageBytes))
 	if len(got) > maxMessageBytes {
 		t.Errorf("len = %d, want <= %d", len(got), maxMessageBytes)
 	}
-	if !utf8.ValidString(got) {
-		t.Errorf("result is not valid UTF-8: %q", got)
-	}
-	if strings.ContainsFunc(got, unicode.IsControl) {
-		t.Errorf("result holds a control character: %q", got)
-	}
 	if !strings.HasPrefix(got, "\uFFFD") {
 		t.Errorf("want the invalid bytes shown as U+FFFD, got %q", got)
+	}
+}
+
+// FuzzCleanText pins the properties every printed provider value relies on:
+// within the cap, valid UTF-8, no character CleanText promises to replace,
+// no surrounding whitespace, and stable when cleaned again.
+func FuzzCleanText(f *testing.F) {
+	for _, seed := range []string{"", "ok", "\x1b[2J", "\xff\xfe", "a\u2028b\u202ec", strings.Repeat("\u20ac", 300), strings.Repeat(" ", 600) + "x"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		got := CleanText(in)
+		if len(got) > maxMessageBytes {
+			t.Fatalf("len = %d, want <= %d", len(got), maxMessageBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("not valid UTF-8: %q", got)
+		}
+		if strings.ContainsFunc(got, isUnsafe) {
+			t.Fatalf("holds a replaced character: %q", got)
+		}
+		if strings.TrimSpace(got) != got {
+			t.Fatalf("surrounding whitespace: %q", got)
+		}
+		if again := CleanText(got); again != got {
+			t.Fatalf("not stable: %q -> %q", got, again)
+		}
+	})
+}
+
+// TestRequestIDsAreCleaned checks that a request id from a header or a body
+// cannot carry a control sequence into APIError.Error.
+func TestRequestIDsAreCleaned(t *testing.T) {
+	t.Parallel()
+
+	h := http.Header{}
+	h.Set("X-Request-ID", "req-\u009b2J")
+	if got := headerRequestID(h); got != "req- 2J" {
+		t.Errorf("headerRequestID = %q, want the C1 control replaced", got)
+	}
+	ts := http.Header{}
+	ts.Set("X-Typesafe-Request-Id", "ts-\u202eid")
+	if got := headerRequestID(ts); got != "ts- id" {
+		t.Errorf("headerRequestID(TypeSafe) = %q, want the bidi control replaced", got)
+	}
+	if got := bodyRequestID([]byte(`{"id":"req\u001b]0;x\u0007-9"}`)); got != "req ]0;x -9" {
+		t.Errorf("bodyRequestID = %q, want the controls replaced", got)
 	}
 }
 

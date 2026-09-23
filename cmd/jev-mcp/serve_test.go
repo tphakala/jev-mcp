@@ -393,7 +393,7 @@ func TestServeCommandHTTPToken(t *testing.T) {
 			}
 			// An unauthenticated server is also reported at warn level, so it
 			// shows at -log-level warn; an authenticated one is not.
-			gotWarn := strings.Contains(stderr.String(), "level=WARN msg="+strconv.Quote(logMsgHTTPNoAuth))
+			gotWarn := strings.Contains(stderr.String(), "level=WARN msg="+strconv.Quote(logMsgHTTPNoAuth)+" addr="+addr)
 			if wantWarn := tt.wantAuth == "auth=false"; gotWarn != wantWarn {
 				t.Errorf("no-auth warning present = %v, want %v (stderr: %s)", gotWarn, wantWarn, stderr.String())
 			}
@@ -421,8 +421,8 @@ func TestServeCommandBlankToken(t *testing.T) {
 	}{
 		{name: "blank flag refused", opts: serveOptions{httpToken: " \t", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrBlankHTTPToken.Error()},
 		{name: "blank env refused", envToken: " \n", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrBlankHTTPToken.Error()},
-		{name: "control character in flag refused", opts: serveOptions{httpToken: "tok\x7f", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrInvalidHTTPToken.Error()},
-		{name: "control character in env refused", envToken: "to\x0bk", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrInvalidHTTPToken.Error()},
+		{name: "control character in flag refused", opts: serveOptions{httpToken: "zqx\x7f", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrInvalidHTTPToken.Error()},
+		{name: "control character in env refused", envToken: "zq\x0bx", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrInvalidHTTPToken.Error()},
 		{name: "flag overrides blank env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, envToken: " \n", wantCode: exitOK, wantStderr: "auth=true"},
 		{name: "stdio ignores blank env", opts: serveOptions{httpAddr: "-"}, envToken: " \n", wantCode: exitOK, wantStderr: logMsgServeStdio},
 	}
@@ -444,6 +444,16 @@ func TestServeCommandBlankToken(t *testing.T) {
 			}
 			if got := stderr.String(); !strings.Contains(got, tt.wantStderr) {
 				t.Errorf("stderr %q does not contain %q", got, tt.wantStderr)
+			}
+			// The rejected tokens in this table start with "zq"; none may be
+			// echoed.
+			if got := stderr.String(); strings.Contains(got, "zq") {
+				t.Errorf("stderr %q echoes a rejected token", got)
+			}
+			// Stdio never reads the token, so it never warns about running
+			// without one.
+			if tt.opts.httpAddr == "" && strings.Contains(stderr.String(), logMsgHTTPNoAuth) {
+				t.Errorf("stdio mode logged the HTTP no-auth warning: %s", stderr.String())
 			}
 		})
 	}

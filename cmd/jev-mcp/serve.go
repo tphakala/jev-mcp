@@ -93,7 +93,7 @@ func serveCommand(ctx context.Context, opts serveOptions, getenv func(string) st
 	if token == "" {
 		// A warning, not only auth=false on the info line below, so an
 		// unauthenticated server stays visible at -log-level warn, including when
-		// "-http-token $TOK" expanded an unset variable to an empty value.
+		// -http-token "$TOK" expanded an unset variable to an empty value.
 		logger.Warn(logMsgHTTPNoAuth, slog.String("addr", opts.httpAddr))
 	}
 	logger.Info(logMsgServeHTTP,

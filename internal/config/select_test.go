@@ -239,6 +239,9 @@ func TestSelectTrimsKeysAndNamesTheVariable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected err = %v", err)
 	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 providers, got %d", len(got))
+	}
 	if got[0].APIKey != "ts-secret" || got[1].APIKey != "or-secret" {
 		t.Errorf("keys = %q, %q; want trimmed ts-secret, or-secret", got[0].APIKey, got[1].APIKey)
 	}
