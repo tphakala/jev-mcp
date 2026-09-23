@@ -462,6 +462,8 @@ func TestExtractMessage(t *testing.T) {
 	t.Parallel()
 
 	long := strings.Repeat("x", maxMessageBytes+100)
+	// A Persian word with a zero-width non-joiner, then an emoji ZWJ sequence.
+	const joined = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \U0001F468\u200d\U0001F469"
 	cases := []struct {
 		name, body, want string
 	}{
@@ -469,7 +471,9 @@ func TestExtractMessage(t *testing.T) {
 		{"error object", `{"error":{"code":401,"message":"bad key"}}`, "bad key"},
 		{"error string", `{"error":"bad key"}`, "bad key"},
 		// The TypeSafe envelope as it came back live for an unknown model.
-		{"typesafe detail object", `{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-nope"}}`, "Unknown model: jev-nope"},
+		{"typesafe detail object", `{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-nope"}}`, "api_usage_error: Unknown model: jev-nope"},
+		{"blank error_type is not a prefix", `{"detail":{"error_type":" ","message":"m"}}`, "m"},
+		{"error_type without a message is skipped", `{"detail":{"error_type":"x"},"message":"m"}`, "m"},
 		{"detail string", `{"detail":"nope"}`, "nope"},
 		{"message", `{"message":"slow down"}`, "slow down"},
 		{"error wins over detail", `{"error":"first","detail":"second"}`, "first"},
@@ -483,6 +487,39 @@ func TestExtractMessage(t *testing.T) {
 		{"detail array falls back to body", `{"detail":[{"msg":"field required"}]}`, `{"detail":[{"msg":"field required"}]}`},
 		{"not json", "upstream timeout", "upstream timeout"},
 		{"long field is capped", `{"detail":{"message":"` + long + `"}}`, long[:maxMessageBytes]},
+		// The raw-body path at and just over the cap.
+		{"raw body at exactly the cap is kept whole", long[:maxMessageBytes], long[:maxMessageBytes]},
+		{"raw body one over the cap is cut", long[:maxMessageBytes+1], long[:maxMessageBytes]},
+		// JSON-escaped control characters, such as a terminal escape, are decoded
+		// by json.Unmarshal and must not survive into the message.
+		{"escaped terminal escape in a field", `{"message":"\u001b[31mred\u001b[0m"}`, "[31mred [0m"},
+		{"line breaks in a field", `{"message":"one\ntwo\r\nthree"}`, "one two  three"},
+		{"C1 control in a field", `{"message":"a\u0085b"}`, "a b"},
+		{"raw body control characters", "bad\x1b[2Jgateway\x00", "bad [2Jgateway"},
+		{"raw body invalid UTF-8 run becomes one U+FFFD", "bad \xff\xfe gateway", "bad \uFFFD gateway"},
+		// A field that is empty once cleaned does not hide the next one.
+		{"control-only field falls through", `{"error":"\u0000","detail":{"message":"real reason"}}`, "real reason"},
+		{"blank message with a type falls through", `{"detail":{"error_type":"x","message":" "},"message":"m"}`, "m"},
+		{"control message with a type falls through", `{"detail":{"error_type":"x","message":"\u0007"},"message":"m"}`, "m"},
+		{"non-string error_type is ignored", `{"detail":{"error_type":404,"message":"Not found"}}`, "Not found"},
+		{"object error_type is ignored", `{"detail":{"error_type":{"a":1},"message":"Not found"}}`, "Not found"},
+		{"error_type blank once cleaned is not a prefix", `{"detail":{"error_type":"\u0007","message":"m"}}`, "m"},
+		// Padding cannot push the text out of the cap.
+		{"padded field", `{"message":"` + strings.Repeat(" ", 600) + `real"}`, "real"},
+		{"raw body padded with NUL", strings.Repeat("\x00", 600) + "real", "real"},
+		// Unicode line separators and bidi controls are replaced; joiners stay.
+		{"separators and bidi controls", `{"message":"a\u2028b\u202ec\u2066d\u2029e\u200ff"}`, "a b c d e f"},
+		{"zero-width joiners kept", `{"message":"` + joined + `"}`, joined},
+		{"long error_type is not a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes+1) + `","message":"Unknown model"}}`, "Unknown model"},
+		// The limit applies to the cleaned error_type, not the raw one.
+		{"padded error_type is measured once cleaned", `{"detail":{"error_type":"` + strings.Repeat(" ", 100) + `t","message":"m"}}`, "t: m"},
+		{"error_type at the limit is a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes) + `","message":"m"}}`, strings.Repeat("t", maxErrorTypeBytes) + ": m"},
+		// The back-off stops three bytes before the cap: one valid byte more
+		// would be lost if it went further.
+		{"back-off limit", strings.Repeat("x", maxMessageBytes-3) + strings.Repeat("\x80", 8), strings.Repeat("x", maxMessageBytes-3) + "\uFFFD"},
+		{"prefixed message cut at a space is trimmed", `{"detail":{"error_type":"t","message":"` + strings.Repeat("x", maxMessageBytes-4) + ` y"}}`, "t: " + strings.Repeat("x", maxMessageBytes-4)},
+		// Invalid bytes at the cut become U+FFFD instead of eating valid text.
+		{"raw body of continuation bytes at the cut", "ab" + strings.Repeat("\x80", 600), "ab\uFFFD"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -491,6 +528,105 @@ func TestExtractMessage(t *testing.T) {
 				t.Errorf("extractMessage(%q) = %q, want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCleanTextStaysWithinCap checks that replacing invalid bytes with the
+// three-byte U+FFFD cannot push a text past the cap.
+func TestCleanTextStaysWithinCap(t *testing.T) {
+	t.Parallel()
+
+	got := CleanText(strings.Repeat("\xff\x1b", maxMessageBytes))
+	if len(got) > maxMessageBytes {
+		t.Errorf("len = %d, want <= %d", len(got), maxMessageBytes)
+	}
+	if !strings.HasPrefix(got, "\uFFFD") {
+		t.Errorf("want the invalid bytes shown as U+FFFD, got %q", got)
+	}
+}
+
+// FuzzCleanText pins the properties every printed provider value relies on:
+// within the cap, valid UTF-8, no character CleanText promises to replace,
+// no surrounding whitespace, and stable when cleaned again.
+func FuzzCleanText(f *testing.F) {
+	for _, seed := range []string{"", "ok", "quota exceeded for key q-1", "\x1b[2J", "\xff\xfe", "a\u2028b\u202ec", strings.Repeat("\u20ac", 300), strings.Repeat(" ", 600) + "x"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		got := CleanText(in)
+		if len(got) > maxMessageBytes {
+			t.Fatalf("len = %d, want <= %d", len(got), maxMessageBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("not valid UTF-8: %q", got)
+		}
+		if strings.ContainsFunc(got, isUnsafe) {
+			t.Fatalf("holds a replaced character: %q", got)
+		}
+		if strings.TrimSpace(got) != got {
+			t.Fatalf("surrounding whitespace: %q", got)
+		}
+		if again := CleanText(got); again != got {
+			t.Fatalf("not stable: %q -> %q", got, again)
+		}
+		// Safe text is left alone: printable ASCII with no surrounding space
+		// that fits the cap comes back unchanged.
+		if len(in) <= maxMessageBytes && strings.TrimSpace(in) == in && !strings.ContainsFunc(in, func(r rune) bool { return r < ' ' || r > '~' }) && got != in {
+			t.Fatalf("printable text changed: %q -> %q", in, got)
+		}
+	})
+}
+
+// TestRequestIDsAreCleaned checks that a request id from a header or a body
+// cannot carry a control sequence into APIError.Error.
+func TestRequestIDsAreCleaned(t *testing.T) {
+	t.Parallel()
+
+	h := http.Header{}
+	h.Set("X-Request-ID", "req-\u009b2J")
+	if got := headerRequestID(h); got != "req- 2J" {
+		t.Errorf("headerRequestID = %q, want the C1 control replaced", got)
+	}
+	ts := http.Header{}
+	ts.Set("X-Typesafe-Request-Id", "ts-\u202eid")
+	if got := headerRequestID(ts); got != "ts- id" {
+		t.Errorf("headerRequestID(TypeSafe) = %q, want the bidi control replaced", got)
+	}
+	both := http.Header{}
+	both.Set("X-Typesafe-Request-Id", "\u0085")
+	both.Set("X-Request-ID", "req-2")
+	if got := headerRequestID(both); got != "req-2" {
+		t.Errorf("headerRequestID = %q, want the second header when the first cleans to nothing", got)
+	}
+	if got := bodyRequestID([]byte(`{"id":"req\u001b]0;x\u0007-9"}`)); got != "req ]0;x -9" {
+		t.Errorf("bodyRequestID = %q, want the controls replaced", got)
+	}
+}
+
+// errTransport is a RoundTripper that fails every request with a fixed error.
+type errTransport struct{ err error }
+
+func (e errTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
+
+// TestTransportErrorMessageIsCleaned checks that transport error text, which
+// can carry server-controlled bytes (a certificate's names in a hostname
+// mismatch, for example), is cleaned like a provider message.
+func TestTransportErrorMessageIsCleaned(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, "https://example.invalid",
+		WithHTTPClient(&http.Client{Transport: errTransport{errors.New("x509: certificate is valid for \x1b[2Jevil\u202e, not example.invalid")}}),
+		WithMaxRetries(0))
+	_, err := c.Evaluate(t.Context(), sampleRequest())
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
+		t.Fatalf("err = %v, want an *APIError", err)
+	}
+	if strings.ContainsFunc(apiErr.Message, isUnsafe) {
+		t.Errorf("Message %q holds a character CleanText replaces", apiErr.Message)
+	}
+	if !strings.Contains(apiErr.Message, "evil") {
+		t.Errorf("Message %q lost the text", apiErr.Message)
 	}
 }
 

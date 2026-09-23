@@ -16,6 +16,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -90,8 +91,9 @@ const (
 // Config is the resolved process configuration. The base URL fields hold the
 // override only: an empty value means "use the provider's default base", which
 // the provider constructors apply. TypeSafeKey, OpenRouterKey, and HTTPToken are
-// secrets and are absent from Sources. HTTPToken is the raw environment value;
-// pass it through [NormalizeHTTPToken] before using it.
+// secrets and are absent from Sources. All three hold the raw environment
+// value: [Select] passes the keys through [NormalizeAPIKey], and HTTP mode must
+// pass the token through [NormalizeHTTPToken] before using it.
 type Config struct {
 	Provider          ProviderMode
 	TypeSafeKey       string
@@ -138,6 +140,20 @@ var (
 	// an HTTP bearer token that is set but holds only spaces, tabs, and line
 	// breaks. It never includes the value.
 	ErrBlankHTTPToken = errors.New("config: HTTP bearer token is only whitespace")
+	// ErrInvalidHTTPToken is returned by [NormalizeHTTPToken] for an HTTP bearer
+	// token that holds an ASCII control character (other than tab) after
+	// trimming, which net/http rejects in a received header, so no request
+	// could present it. It never includes the value.
+	ErrInvalidHTTPToken = errors.New("config: HTTP bearer token contains a control character")
+	// ErrBlankAPIKey is returned by [NormalizeAPIKey], and so by [Select], for an
+	// API key that is set but holds only spaces, tabs, and line breaks. It never
+	// includes the value.
+	ErrBlankAPIKey = errors.New("config: API key is only whitespace")
+	// ErrInvalidAPIKey is returned by [NormalizeAPIKey], and so by [Select], for
+	// an API key that holds an ASCII control character (other than tab) after
+	// trimming, which net/http refuses to send in a header. It never includes
+	// the value.
+	ErrInvalidAPIKey = errors.New("config: API key contains a control character")
 )
 
 // Resolve builds a Config from the environment read through getenv (pass
@@ -311,22 +327,50 @@ func resolveFallback(cfg *Config, getenv func(string) string) error {
 	return nil
 }
 
-// httpTokenTrim is what [NormalizeHTTPToken] strips from each end of a token:
-// the space and tab that net/http strips from a received header value
-// (net/textproto reader.go:108 and :581, Go 1.27.1), plus CR and LF, which cannot appear in a
-// header value at all.
-const httpTokenTrim = " \t\r\n"
-
-// NormalizeHTTPToken prepares an HTTP bearer token for use by trimming
-// [httpTokenTrim] from both ends, so a token pasted with a trailing space or
-// newline still matches what a client can send. An empty value stays empty,
-// meaning no authentication. A value that is non-empty but only trimmable
-// characters returns [ErrBlankHTTPToken] rather than an empty token, so a
-// configured token never turns into "no authentication".
+// NormalizeHTTPToken prepares an HTTP bearer token for use. It trims spaces,
+// tabs, CR, and LF from both ends with [textproto.TrimString]: the space and
+// tab net/http strips from a received header value (net/textproto reader.go
+// trim, Go 1.27.1), plus CR and LF, which end a header line and so cannot be
+// part of a value. A token pasted with a trailing space or newline therefore
+// still matches what a client can send. An empty value stays empty, meaning
+// no authentication. A value that is non-empty but only those characters
+// returns [ErrBlankHTTPToken] rather than an empty token, so a configured token
+// never turns into "no authentication", and one that still holds an ASCII
+// control character other than tab returns [ErrInvalidHTTPToken]. Neither
+// error includes the value.
 func NormalizeHTTPToken(v string) (string, error) {
-	token := strings.Trim(v, httpTokenTrim)
-	if token == "" && v != "" {
-		return "", ErrBlankHTTPToken
+	return normalizeSecret(v, ErrBlankHTTPToken, ErrInvalidHTTPToken)
+}
+
+// NormalizeAPIKey prepares a provider API key for use the same way as
+// [NormalizeHTTPToken]: surrounding spaces, tabs, and line breaks are trimmed;
+// an empty value stays empty (the key is unset); a value that is only those
+// characters returns [ErrBlankAPIKey]; and a value that still holds an ASCII
+// control character other than tab returns [ErrInvalidAPIKey]. Neither error
+// includes the value.
+func NormalizeAPIKey(v string) (string, error) {
+	return normalizeSecret(v, ErrBlankAPIKey, ErrInvalidAPIKey)
+}
+
+// normalizeSecret trims v and checks that what is left can travel in an HTTP
+// header. A header value may not hold a control byte other than tab: net/http
+// refuses to send one and rejects a request that carries one
+// (httpguts.ValidHeaderFieldValue, vendored in Go 1.27.1). errBlank is returned
+// for a non-empty value that trims to nothing, errInvalid for a value that
+// still holds such a byte.
+func normalizeSecret(v string, errBlank, errInvalid error) (string, error) {
+	s := textproto.TrimString(v)
+	if s == "" && v != "" {
+		return "", errBlank
 	}
-	return token, nil
+	if strings.ContainsFunc(s, isHeaderControl) {
+		return "", errInvalid
+	}
+	return s, nil
+}
+
+// isHeaderControl reports whether r is a control character that cannot appear
+// in an HTTP header value: an ASCII control other than tab, or DEL.
+func isHeaderControl(r rune) bool {
+	return (r < ' ' && r != '\t') || r == 0x7f
 }

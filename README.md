@@ -27,7 +27,7 @@ export TYPESAFE_API_KEY=...
 jev-mcp doctor -probe
 ```
 
-`doctor` prints the resolved settings and where each came from, and `-probe` makes one small live call per configured provider. Credentials are never printed.
+`doctor` prints the resolved settings and where each came from, and `-probe` makes one small live call per selected provider, all providers at once. API keys and the HTTP token are never printed; each is shown as `set`, `unset`, `blank` (only spaces, tabs, and line breaks), or `invalid` (holds an ASCII control character other than tab).
 
 Add the server to Claude Code:
 
@@ -68,7 +68,7 @@ Serve flags:
 | Flag | Meaning |
 | --- | --- |
 | `-http addr` | Serve Streamable HTTP on `addr` instead of stdio. The host must be loopback (`127.0.0.1`, `::1`, or a name that resolves only to loopback); anything else is refused. |
-| `-http-token token` | Require `Authorization: Bearer <token>` in HTTP mode. Overrides `JEV_MCP_HTTP_TOKEN`; an explicit empty value forces unauthenticated. Trimmed and checked like the variable. |
+| `-http-token token` | Require `Authorization: Bearer <token>` in HTTP mode. Overrides `JEV_MCP_HTTP_TOKEN`; an explicit empty value forces unauthenticated. Trimmed and checked like the variable. Without a token, HTTP mode logs a warning at startup. |
 | `-log-level level` | `debug`, `info` (default), `warn`, or `error`. |
 | `-log-json` | Write logs as JSON instead of text. |
 
@@ -91,9 +91,11 @@ Everything is read from the environment. `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`
 | `JEV_MCP_MAX_RETRIES` | `2` | Retries per provider after the first attempt. |
 | `JEV_MCP_TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | TypeSafe base URL. `TYPESAFE_BASE_URL` is read when this is unset. |
 | `JEV_MCP_OPENROUTER_BASE_URL` | `https://openrouter.ai/api` | OpenRouter base URL. |
-| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Leading and trailing spaces, tabs, and line breaks are trimmed; HTTP mode refuses to start when nothing else is left, unless `-http-token` overrides it. Stdio mode ignores it. |
+| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Leading and trailing spaces, tabs, and line breaks are trimmed; HTTP mode refuses to start when nothing else is left, or when what is left holds an ASCII control character other than tab, unless `-http-token` overrides it. Stdio mode ignores it. |
 
-At least one API key is required to serve. Rate limits (429), overload (503, 529), other server errors, request timeouts (408), and transport failures are retried with jittered exponential backoff, honouring `Retry-After` and `Retry-After-Ms` up to a 20 second wait. In `auto` mode with both keys, those failures and a rejected key move on to the fallback provider; a request the provider rejects as invalid does not, since it would fail there too.
+At least one API key is required to serve. The keys are trimmed like the HTTP token. A key that is only spaces, tabs, and line breaks, or that still holds an ASCII control character other than tab (which cannot be sent in a header), stops the server at startup with an error naming the variable whenever that provider would be used, including as the fallback; unset the variable instead of leaving it blank. `doctor` reports such a key even when that provider would not be used.
+
+Rate limits (429), overload (503, 529), other server errors, request timeouts (408), and transport failures are retried with jittered exponential backoff, honouring `Retry-After` and `Retry-After-Ms` up to a 20 second wait. In `auto` mode with both keys, those failures and a rejected key move on to the fallback provider; a request the provider rejects as invalid does not, since it would fail there too.
 
 ## The `jev_evaluate` tool
 
@@ -108,9 +110,9 @@ One tool, `jev_evaluate`, decides one or more questions over a shared state in a
 
 Question types:
 
-- `choice` picks one option. `criteria` is an object of 2 to 255 option names to descriptions; a description may be a string, an object, or `null`.
-- `score` places the state on an ordered scale. `criteria` is an array of 2 to 10 level descriptions, lowest first; a level may be a string or an object.
-- `noul` answers a yes/no proposition. `criteria` is optional: an object with `true` and `false` descriptions. The answer is the probability that the proposition is true.
+- `choice` picks one option. `criteria` is an object of 2 to 255 option names to descriptions. A description is usually a string, an object, or `null`; it is passed to the provider unchecked.
+- `score` places the state on an ordered scale. `criteria` is an array of 2 to 10 level descriptions, lowest first. A level is usually a string or an object; any value but `null` is passed to the provider unchecked.
+- `noul` answers a yes/no proposition. `criteria` is optional: an object whose keys may only be `true` and `false`, each a description. The answer is the probability that the proposition is true.
 
 Example arguments:
 

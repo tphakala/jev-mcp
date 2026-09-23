@@ -19,6 +19,7 @@ const (
 	logMsgServeStdio     = "serving over stdio"
 	logMsgServeHTTP      = "serving Streamable HTTP"
 	logMsgAuthFlagUnused = "-http-token has no effect without -http"
+	logMsgHTTPNoAuth     = "HTTP mode is unauthenticated: any local process can call the tools"
 )
 
 // flagHTTPToken is the -http-token flag name, shared by its definition and
@@ -88,6 +89,12 @@ func serveCommand(ctx context.Context, opts serveOptions, getenv func(string) st
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %s: %v\n", tokenSource, err)
 		return exitError
+	}
+	if token == "" {
+		// A warning, not only auth=false on the info line below, so an
+		// unauthenticated server stays visible at -log-level warn, including when
+		// -http-token "$TOK" expanded an unset variable to an empty value.
+		logger.Warn(logMsgHTTPNoAuth, slog.String("addr", opts.httpAddr))
 	}
 	logger.Info(logMsgServeHTTP,
 		slog.String("addr", opts.httpAddr),

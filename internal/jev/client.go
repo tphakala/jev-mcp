@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	jevmcp "github.com/tphakala/jev-mcp"
@@ -34,8 +35,13 @@ const (
 	// defaultCallBudget is the whole-call timeout when [WithBudget] is not given.
 	defaultCallBudget = 30 * time.Second
 
-	// maxMessageBytes bounds the best-effort error message taken from a body.
+	// maxMessageBytes bounds the best-effort error message taken from a body,
+	// and everything [CleanText] returns.
 	maxMessageBytes = 512
+
+	// maxErrorTypeBytes bounds an error_type kept as a message prefix, so a
+	// long one cannot push the message itself out of maxMessageBytes.
+	maxErrorTypeBytes = 64
 
 	contentTypeJSON = "application/json"
 	userAgentPrefix = "jev-mcp/"
@@ -209,7 +215,7 @@ func (c *Client) Evaluate(ctx context.Context, req Request) (*Result, error) {
 func (c *Client) callProvider(ctx context.Context, p *Provider, req Request) (*Result, int, error) {
 	endpoint, err := p.Endpoint()
 	if err != nil {
-		return nil, 0, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, 0, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	call := req
 	if p.ModelID != nil {
@@ -258,7 +264,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	c.setHeaders(httpReq, p)
 
@@ -267,7 +273,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -280,7 +286,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 			Provider:  p.Name,
 			Status:    resp.StatusCode,
 			Sentinel:  ErrTransport,
-			Message:   err.Error(),
+			Message:   CleanText(err.Error()),
 			RequestID: headerRequestID(resp.Header),
 		}
 	}
@@ -338,7 +344,7 @@ func decodeResponse(p *Provider, resp *http.Response, data []byte) (*Response, e
 			Provider:  p.Name,
 			Status:    resp.StatusCode,
 			Sentinel:  ErrMalformedResponse,
-			Message:   err.Error(),
+			Message:   CleanText(err.Error()),
 			RequestID: requestID(resp, data),
 		}
 	}
@@ -391,63 +397,118 @@ func apiErrorRetryAfter(err error) time.Duration {
 
 // extractMessage pulls a human message from an error body from the "error",
 // "detail", and "message" fields in turn, each either a string or an object
-// with a message, skipping one that is empty or only whitespace, then falls
-// back to the raw body.
+// with a message, skipping one that is empty once cleaned, then falls back to
+// the raw body.
 // TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
-// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
-// result is capped at maxMessageBytes on every path.
+// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401); the
+// error_type is kept as a prefix. Every result is cleaned as [CleanText]
+// cleans.
 func extractMessage(body []byte) string {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return ""
-	}
 	var env struct {
 		Error   json.RawMessage `json:"error"`
 		Detail  json.RawMessage `json:"detail"`
 		Message json.RawMessage `json:"message"`
 	}
-	if err := json.Unmarshal(trimmed, &env); err == nil {
-		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), messageFromError(env.Message)} {
-			if strings.TrimSpace(m) != "" {
-				return truncateMessage([]byte(m))
+	if err := json.Unmarshal(bytes.TrimSpace(body), &env); err == nil {
+		for _, raw := range []json.RawMessage{env.Error, env.Detail, env.Message} {
+			if m := fieldMessage(raw); m != "" {
+				return m
 			}
 		}
 	}
-	return truncateMessage(trimmed)
+	return cleanBytes(body)
 }
 
-// messageFromError reads an "error", "detail", or "message" field that may be
-// an object with a message or a bare string. Any other shape yields "".
-func messageFromError(raw json.RawMessage) string {
+// fieldMessage reads an "error", "detail", or "message" field that may be an
+// object with a message or a bare string, and returns it cleaned. An object's
+// error_type, when it is a string that, once cleaned, is non-empty and at most
+// maxErrorTypeBytes, is prefixed ("api_usage_error: Unknown model") so the
+// provider's classification stays visible. Any other shape, or a message that
+// is empty once cleaned, yields "".
+func fieldMessage(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
 	var obj struct {
-		Message string `json:"message"`
+		Message   string          `json:"message"`
+		ErrorType json.RawMessage `json:"error_type"`
 	}
-	if err := json.Unmarshal(raw, &obj); err == nil && obj.Message != "" {
-		return obj.Message
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		msg := CleanText(obj.Message)
+		if msg == "" {
+			return ""
+		}
+		var errType string
+		if json.Unmarshal(obj.ErrorType, &errType) == nil {
+			if t := CleanText(errType); t != "" && len(t) <= maxErrorTypeBytes {
+				return CleanText(t + ": " + msg)
+			}
+		}
+		return msg
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return CleanText(s)
 	}
 	return ""
 }
 
+// CleanText makes provider-supplied text safe to print: at most 512 bytes,
+// valid UTF-8, and free of characters that can move the cursor or reorder the
+// line on a terminal. It is exported for callers that print other
+// provider-supplied values, such as a response's model or id.
+func CleanText(s string) string {
+	return cleanBytes([]byte(s))
+}
+
+// cleanBytes implements [CleanText]. Leading whitespace and the characters it
+// turns into spaces are dropped first, so padding made of them cannot push the
+// text out of the cap. Then the text is cut to maxMessageBytes, each run of invalid UTF-8
+// becomes one U+FFFD, and every control (Cc), bidirectional control (the
+// overrides, embeddings, isolates, and marks that reorder a line), line
+// separator (Zl), and paragraph separator (Zp) character becomes a space.
+// Other format characters, such as the zero-width joiners that Persian, Indic
+// scripts, and emoji sequences depend on, are kept. Replacing invalid bytes with the three-byte
+// U+FFFD can grow the text past the cap, so it is cut again, and the result is
+// trimmed. The input is cut before it is sanitized, so the work after the
+// leading trim is bounded by the cap, not by the input size.
+func cleanBytes(b []byte) string {
+	b = bytes.TrimLeftFunc(b, isUnsafeOrSpace)
+	s := strings.ToValidUTF8(truncateMessage(b), "\uFFFD")
+	s = strings.Map(func(r rune) rune {
+		if isUnsafe(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.TrimSpace(truncateMessage([]byte(s)))
+}
+
+// isUnsafe reports whether r is a character [CleanText] replaces.
+func isUnsafe(r rune) bool {
+	return unicode.IsControl(r) || unicode.In(r, unicode.Bidi_Control, unicode.Zl, unicode.Zp)
+}
+
+// isUnsafeOrSpace reports whether r is dropped from the start of a text.
+func isUnsafeOrSpace(r rune) bool {
+	return unicode.IsSpace(r) || isUnsafe(r)
+}
+
 // truncateMessage returns the first maxMessageBytes of body as a string. It
-// converts only the needed prefix, not the whole (potentially large) body, and
-// backs off to a UTF-8 rune boundary so a truncated multibyte rune is never
-// emitted.
+// converts only the needed prefix, not the whole (potentially large) body. It
+// backs off at most utf8.UTFMax-1 bytes to the start of a rune, so valid UTF-8
+// is never cut inside a rune; when no rune starts within that distance the
+// bytes there are invalid anyway and the cut stays at maxMessageBytes.
 func truncateMessage(body []byte) string {
 	if len(body) <= maxMessageBytes {
 		return string(body)
 	}
-	end := maxMessageBytes
-	for end > 0 && !utf8.RuneStart(body[end]) {
-		end--
+	for end := maxMessageBytes; end > maxMessageBytes-utf8.UTFMax; end-- {
+		if utf8.RuneStart(body[end]) {
+			return string(body[:end])
+		}
 	}
-	return string(body[:end])
+	return string(body[:maxMessageBytes])
 }
 
 // requestID prefers a request id from the response headers and falls back to a
@@ -459,21 +520,24 @@ func requestID(resp *http.Response, body []byte) string {
 	return bodyRequestID(body)
 }
 
-// headerRequestID reads the TypeSafe or OpenRouter request-id header.
+// headerRequestID reads the TypeSafe or OpenRouter request-id header, cleaned
+// by [CleanText]: net/http rejects ASCII control bytes in a header value but
+// passes bytes from 0x80 up, which may encode C1 controls or invalid UTF-8.
 func headerRequestID(h http.Header) string {
-	if id := h.Get("X-Typesafe-Request-Id"); id != "" {
+	if id := CleanText(h.Get("X-Typesafe-Request-Id")); id != "" {
 		return id
 	}
-	return h.Get("X-Request-ID")
+	return CleanText(h.Get("X-Request-ID"))
 }
 
-// bodyRequestID reads a top-level "id" from a JSON body, if present.
+// bodyRequestID reads a top-level "id" from a JSON body, if present, cleaned
+// by [CleanText].
 func bodyRequestID(body []byte) string {
 	var env struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(body), &env); err == nil {
-		return env.ID
+		return CleanText(env.ID)
 	}
 	return ""
 }

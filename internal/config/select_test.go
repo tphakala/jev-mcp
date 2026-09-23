@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/tphakala/jev-mcp/internal/config"
@@ -90,6 +91,46 @@ func TestSelect(t *testing.T) {
 			name:    "auto no key",
 			cfg:     config.Config{Provider: config.ProviderAuto, Fallback: true},
 			wantErr: config.ErrNoAPIKey,
+		},
+		{
+			name:    "explicit typesafe with blank key",
+			cfg:     config.Config{Provider: config.ProviderTypeSafe, TypeSafeKey: " \n"},
+			wantErr: config.ErrBlankAPIKey,
+		},
+		{
+			name:    "explicit openrouter with control character in key",
+			cfg:     config.Config{Provider: config.ProviderOpenRouter, OpenRouterKey: "or\x7f"},
+			wantErr: config.ErrInvalidAPIKey,
+		},
+		{
+			name: "auto reports a blank primary key rather than falling to the other",
+			cfg: config.Config{
+				Provider:      config.ProviderAuto,
+				TypeSafeKey:   "\n",
+				OpenRouterKey: "or",
+				Fallback:      true,
+			},
+			wantErr: config.ErrBlankAPIKey,
+		},
+		{
+			name: "auto reports a bad fallback key",
+			cfg: config.Config{
+				Provider:      config.ProviderAuto,
+				TypeSafeKey:   "ts",
+				OpenRouterKey: "o\nr",
+				Fallback:      true,
+			},
+			wantErr: config.ErrInvalidAPIKey,
+		},
+		{
+			name: "auto ignores a bad key it will not use",
+			cfg: config.Config{
+				Provider:      config.ProviderAuto,
+				TypeSafeKey:   "ts",
+				OpenRouterKey: "o\nr",
+				Fallback:      false,
+			},
+			wantOrder: []string{jev.ProviderTypeSafe},
 		},
 		{
 			name:    "unknown mode",
@@ -184,6 +225,37 @@ func TestSelectWiresKeysBaseURLsAndModelID(t *testing.T) {
 	// OpenRouter passthrough rather than a value that is a fixed point of both.
 	if got := or.ModelID("typesafe/jev-1.13"); got != "typesafe/jev-1.13" {
 		t.Errorf("openrouter ModelID(typesafe/jev-1.13) = %q, want typesafe/jev-1.13 (passthrough)", got)
+	}
+}
+
+// TestSelectTrimsKeysAndNamesTheVariable confirms a key pasted with surrounding
+// whitespace reaches the provider trimmed, and that a bad key's error names the
+// variable without echoing the value.
+func TestSelectTrimsKeysAndNamesTheVariable(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{Provider: config.ProviderAuto, TypeSafeKey: " ts-secret\r\n", OpenRouterKey: "\tor-secret\n", Fallback: true}
+	got, err := config.Select(&cfg)
+	if err != nil {
+		t.Fatalf("unexpected err = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 providers, got %d", len(got))
+	}
+	if got[0].APIKey != "ts-secret" || got[1].APIKey != "or-secret" {
+		t.Errorf("keys = %q, %q; want trimmed ts-secret, or-secret", got[0].APIKey, got[1].APIKey)
+	}
+
+	bad := config.Config{Provider: config.ProviderOpenRouter, OpenRouterKey: "or-\x00-secret"}
+	_, err = config.Select(&bad)
+	if !errors.Is(err, config.ErrInvalidAPIKey) {
+		t.Fatalf("err = %v, want ErrInvalidAPIKey", err)
+	}
+	if !strings.Contains(err.Error(), config.EnvOpenRouterKey) {
+		t.Errorf("error %q should name %s", err, config.EnvOpenRouterKey)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Errorf("error %q echoes the key", err)
 	}
 }
 
