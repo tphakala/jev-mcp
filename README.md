@@ -74,7 +74,7 @@ Serve flags:
 
 Logs go to stderr; in stdio mode stdout carries only the MCP stream.
 
-In HTTP mode point the client at the listen address, for example `http://127.0.0.1:8765/`. Cross-origin browser POST requests are rejected. Because the bind is loopback only, a container can serve HTTP only with `--network host`; stdio is the supported container mode.
+In HTTP mode point the client at the listen address, for example `http://127.0.0.1:8765/`. Cross-origin browser requests other than GET, HEAD, and OPTIONS are rejected. Because the bind is loopback only, a container can serve HTTP only with `--network host`; stdio is the supported container mode.
 
 ## Configuration
 
@@ -91,7 +91,7 @@ Everything is read from the environment. `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`
 | `JEV_MCP_MAX_RETRIES` | `2` | Retries per provider after the first attempt. |
 | `JEV_MCP_TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | TypeSafe base URL. `TYPESAFE_BASE_URL` is read when this is unset. |
 | `JEV_MCP_OPENROUTER_BASE_URL` | `https://openrouter.ai/api` | OpenRouter base URL. |
-| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Leading and trailing spaces, tabs, and line breaks are trimmed; HTTP mode refuses to start when nothing else is left. Stdio mode ignores it. |
+| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Leading and trailing spaces, tabs, and line breaks are trimmed; HTTP mode refuses to start when nothing else is left, unless `-http-token` overrides it. Stdio mode ignores it. |
 
 At least one API key is required to serve. Rate limits (429), overload (503, 529), other server errors, request timeouts (408), and transport failures are retried with jittered exponential backoff, honouring `Retry-After` and `Retry-After-Ms` up to a 20 second wait. In `auto` mode with both keys, those failures and a rejected key move on to the fallback provider; a request the provider rejects as invalid does not, since it would fail there too.
 

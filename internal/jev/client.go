@@ -388,9 +388,9 @@ func apiErrorRetryAfter(err error) time.Duration {
 	return 0
 }
 
-// extractMessage pulls a human message from an error body, trying
-// {"error":{"message"}}, {"error":"..."}, {"detail":{"message"}},
-// {"detail":"..."}, and {"message"} in turn, then falling back to the raw body.
+// extractMessage pulls a human message from an error body from the "error",
+// "detail", and "message" fields in turn, each either a string or an object
+// with a message, then falls back to the raw body.
 // TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
 // (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
 // result is capped at maxMessageBytes on every path.

@@ -110,8 +110,8 @@ type Config struct {
 	Sources map[string]string
 }
 
-// Configuration errors. Each sentinel names the offending variable; the parse
-// errors additionally append the offending value (redacted when over-long).
+// Configuration errors. The parse errors from [Resolve] name the offending
+// variable and append the offending value (redacted when over-long).
 // ErrNoAPIKey and ErrProviderKeyMissing are returned by [Select], not [Resolve]:
 // a missing key is a selection failure, not a parse failure, so [Resolve] still
 // succeeds and a diagnostic caller can render the settings before the provider
@@ -313,7 +313,7 @@ func resolveFallback(cfg *Config, getenv func(string) string) error {
 
 // httpTokenTrim is what [NormalizeHTTPToken] strips from each end of a token:
 // the space and tab that net/http strips from a received header value
-// (net/textproto trim, Go 1.27.1), plus CR and LF, which cannot appear in a
+// (net/textproto reader.go:108 and :581, Go 1.27.1), plus CR and LF, which cannot appear in a
 // header value at all.
 const httpTokenTrim = " \t\r\n"
 

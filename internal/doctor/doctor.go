@@ -244,7 +244,7 @@ func defaultModelCheck(model string) check {
 func httpTokenCheck(cfg *config.Config) check {
 	const name = "http token"
 	if _, err := config.NormalizeHTTPToken(cfg.HTTPToken); err != nil {
-		return check{statusWarn, name, config.EnvHTTPToken + " is set but only whitespace; HTTP serve mode would refuse to start"}
+		return check{statusWarn, name, config.EnvHTTPToken + " is set but only whitespace; HTTP serve mode would refuse to start unless -http-token is given"}
 	}
 	if cfg.HTTPToken == "" {
 		return check{statusPass, name, "unset (HTTP serve mode would be unauthenticated)"}
