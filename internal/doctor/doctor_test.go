@@ -126,6 +126,58 @@ func TestRunKeyFormatWarnsOnWhitespaceAndCoversHTTPToken(t *testing.T) {
 	}
 }
 
+// TestRunHTTPTokenNormalized checks that doctor judges the HTTP token as serve
+// uses it, after config.NormalizeHTTPToken: a trailing newline is not a format
+// problem because serve trims it, and a blank token is one warning that names
+// the variable, not a failed run, since stdio mode does not use it.
+func TestRunHTTPTokenNormalized(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		token    string
+		want     []string
+		dontWant []string
+	}{
+		{
+			name:     "trailing newline is trimmed",
+			token:    "tok\n",
+			want:     []string{"[PASS] credential format", "[PASS] http token: set"},
+			dontWant: []string{"[WARN]"},
+		},
+		{
+			name:     "blank token warns",
+			token:    " \t",
+			want:     []string{"[WARN] http token: " + config.EnvHTTPToken + " is set but only whitespace", "[PASS] credential format"},
+			dontWant: []string{"[FAIL]", "[PASS] http token"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var out strings.Builder
+			code := doctor.Run(t.Context(), &out, getenvFrom(map[string]string{
+				config.EnvTypeSafeKey: "ts-key",
+				config.EnvHTTPToken:   tt.token,
+			}), false, nil)
+			got := out.String()
+			if code != 0 {
+				t.Errorf("exit code = %d, want 0\n%s", code, got)
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("output lacks %q\n%s", w, got)
+				}
+			}
+			for _, w := range tt.dontWant {
+				if strings.Contains(got, w) {
+					t.Errorf("output contains %q\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
 func TestRunDefaultModelWarn(t *testing.T) {
 	t.Parallel()
 

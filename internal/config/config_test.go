@@ -202,6 +202,16 @@ func TestResolveValues(t *testing.T) {
 			},
 			mutate: func(w *wantConfig) { w.tsKey, w.httpToken = "ts-key", "http-bearer" },
 		},
+		{
+			// Resolve keeps the token verbatim; the serve and doctor code that
+			// use it normalize it.
+			name: "http token is kept verbatim",
+			env: map[string]string{
+				config.EnvTypeSafeKey: "ts-key",
+				config.EnvHTTPToken:   " http-bearer\r\n",
+			},
+			mutate: func(w *wantConfig) { w.tsKey, w.httpToken = "ts-key", " http-bearer\r\n" },
+		},
 	}
 
 	for _, tt := range tests {
@@ -438,5 +448,41 @@ func TestResolveNeverRecordsSecretsInSources(t *testing.T) {
 		if k == config.EnvTypeSafeKey || k == config.EnvOpenRouterKey || k == config.EnvHTTPToken {
 			t.Errorf("Sources contains a credential env name as a key: %q", k)
 		}
+	}
+}
+
+func TestNormalizeHTTPToken(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, in, want string
+		wantErr        bool
+	}{
+		{name: "empty stays empty", in: "", want: ""},
+		{name: "clean", in: "tok", want: "tok"},
+		{name: "trailing newline", in: "tok\n", want: "tok"},
+		{name: "surrounding spaces and tabs", in: " \ttok \t", want: "tok"},
+		{name: "inner space kept", in: "to k", want: "to k"},
+		// net/http does not trim a non-breaking space from a header value, so
+		// neither does the normalizer.
+		{name: "non-breaking space kept", in: "\u00a0tok\u00a0", want: "\u00a0tok\u00a0"},
+		{name: "only non-breaking space is a token", in: "\u00a0", want: "\u00a0"},
+		{name: "only spaces", in: "  ", wantErr: true},
+		{name: "only line breaks", in: "\r\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := config.NormalizeHTTPToken(tt.in)
+			if tt.wantErr {
+				if !errors.Is(err, config.ErrBlankHTTPToken) {
+					t.Errorf("NormalizeHTTPToken(%q) error = %v, want ErrBlankHTTPToken", tt.in, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("NormalizeHTTPToken(%q) = %q, %v; want %q, nil", tt.in, got, err, tt.want)
+			}
+		})
 	}
 }

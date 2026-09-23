@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -346,6 +347,7 @@ func TestServeCommandHTTPToken(t *testing.T) {
 	tests := []struct {
 		name     string
 		opts     serveOptions
+		envToken string // defaults to "env-tok"
 		authz    string
 		want401  bool
 		wantAuth string
@@ -355,13 +357,16 @@ func TestServeCommandHTTPToken(t *testing.T) {
 		{name: "flag token overrides env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer env-tok", want401: true, wantAuth: "auth=true"},
 		{name: "flag token accepted", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer flag-tok", wantAuth: "auth=true"},
 		{name: "empty flag disables auth", opts: serveOptions{httpTokenSet: true}, wantAuth: "auth=false"},
+		{name: "flag token is trimmed", opts: serveOptions{httpToken: " flag-tok\n", httpTokenSet: true}, authz: "Bearer flag-tok", wantAuth: "auth=true"},
+		{name: "env token is trimmed", envToken: " env-tok\r\n", authz: "Bearer env-tok", wantAuth: "auth=true"}, //nolint:gosec // G101: a test fixture, not a credential.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			addr := freeLoopbackAddr(t)
 			tt.opts.httpAddr = addr
-			env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-key", config.EnvHTTPToken: "env-tok"})
+			envToken := cmp.Or(tt.envToken, "env-tok")
+			env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-key", config.EnvHTTPToken: envToken})
 			ctx, cancel := context.WithCancel(t.Context())
 			var stderr syncBuffer
 			done := make(chan int, 1)
@@ -387,6 +392,49 @@ func TestServeCommandHTTPToken(t *testing.T) {
 			}
 			if got := stderr.String(); strings.Contains(got, "env-tok") || strings.Contains(got, "flag-tok") {
 				t.Error("the HTTP token reached the log")
+			}
+		})
+	}
+}
+
+// TestServeCommandBlankToken checks where a token of only whitespace is
+// refused: only when HTTP mode would use it. A blank environment token does not
+// stop stdio mode, which never reads it, or HTTP mode when -http-token
+// overrides it. The context is cancelled up front so a server that does start
+// returns at once instead of serving.
+func TestServeCommandBlankToken(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		opts       serveOptions
+		envToken   string
+		wantCode   int
+		wantStderr string
+	}{
+		{name: "blank flag refused", opts: serveOptions{httpToken: " \t", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrBlankHTTPToken.Error()},
+		{name: "blank env refused", envToken: " \n", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrBlankHTTPToken.Error()},
+		{name: "flag overrides blank env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, envToken: " \n", wantCode: exitOK, wantStderr: "auth=true"},
+		{name: "stdio ignores blank env", opts: serveOptions{httpAddr: "-"}, envToken: " \n", wantCode: exitOK, wantStderr: logMsgServeStdio},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.opts.httpAddr == "-" {
+				tt.opts.httpAddr = ""
+			} else {
+				tt.opts.httpAddr = freeLoopbackAddr(t)
+			}
+			env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-key", config.EnvHTTPToken: tt.envToken})
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			var stderr syncBuffer
+			code := serveCommand(ctx, tt.opts, env, noLookup(t), io.NopCloser(strings.NewReader("")), io.Discard, &stderr)
+			if code != tt.wantCode {
+				t.Fatalf("exit = %d, want %d (stderr: %s)", code, tt.wantCode, stderr.String())
+			}
+			if got := stderr.String(); !strings.Contains(got, tt.wantStderr) {
+				t.Errorf("stderr %q does not contain %q", got, tt.wantStderr)
 			}
 		})
 	}

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -89,7 +90,8 @@ const (
 // Config is the resolved process configuration. The base URL fields hold the
 // override only: an empty value means "use the provider's default base", which
 // the provider constructors apply. TypeSafeKey, OpenRouterKey, and HTTPToken are
-// secrets and are absent from Sources.
+// secrets and are absent from Sources. HTTPToken is the raw environment value;
+// pass it through [NormalizeHTTPToken] before using it.
 type Config struct {
 	Provider          ProviderMode
 	TypeSafeKey       string
@@ -108,8 +110,8 @@ type Config struct {
 	Sources map[string]string
 }
 
-// Configuration errors. Each sentinel names the offending variable; the parse
-// errors additionally append the offending value (redacted when over-long).
+// Configuration errors. The parse errors from [Resolve] name the offending
+// variable and append the offending value (redacted when over-long).
 // ErrNoAPIKey and ErrProviderKeyMissing are returned by [Select], not [Resolve]:
 // a missing key is a selection failure, not a parse failure, so [Resolve] still
 // succeeds and a diagnostic caller can render the settings before the provider
@@ -132,6 +134,10 @@ var (
 	ErrInvalidMaxRetries = errors.New("config: invalid JEV_MCP_MAX_RETRIES")
 	// ErrInvalidFallback is returned for an unparsable JEV_MCP_FALLBACK.
 	ErrInvalidFallback = errors.New("config: invalid JEV_MCP_FALLBACK")
+	// ErrBlankHTTPToken is returned by [NormalizeHTTPToken], not [Resolve], for
+	// an HTTP bearer token that is set but holds only spaces, tabs, and line
+	// breaks. It never includes the value.
+	ErrBlankHTTPToken = errors.New("config: HTTP bearer token is only whitespace")
 )
 
 // Resolve builds a Config from the environment read through getenv (pass
@@ -303,4 +309,24 @@ func resolveFallback(cfg *Config, getenv func(string) string) error {
 	cfg.Sources[SourceFallback] = EnvFallback
 	cfg.Fallback = b
 	return nil
+}
+
+// httpTokenTrim is what [NormalizeHTTPToken] strips from each end of a token:
+// the space and tab that net/http strips from a received header value
+// (net/textproto reader.go:108 and :581, Go 1.27.1), plus CR and LF, which cannot appear in a
+// header value at all.
+const httpTokenTrim = " \t\r\n"
+
+// NormalizeHTTPToken prepares an HTTP bearer token for use by trimming
+// [httpTokenTrim] from both ends, so a token pasted with a trailing space or
+// newline still matches what a client can send. An empty value stays empty,
+// meaning no authentication. A value that is non-empty but only trimmable
+// characters returns [ErrBlankHTTPToken] rather than an empty token, so a
+// configured token never turns into "no authentication".
+func NormalizeHTTPToken(v string) (string, error) {
+	token := strings.Trim(v, httpTokenTrim)
+	if token == "" && v != "" {
+		return "", ErrBlankHTTPToken
+	}
+	return token, nil
 }

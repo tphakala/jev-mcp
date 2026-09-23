@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -388,9 +389,13 @@ func apiErrorRetryAfter(err error) time.Duration {
 	return 0
 }
 
-// extractMessage pulls a human message from an error body, trying
-// {"error":{"message"}}, {"error":"..."}, {"detail"}, and {"message"} in turn,
-// then falling back to the first maxMessageBytes of the raw body.
+// extractMessage pulls a human message from an error body from the "error",
+// "detail", and "message" fields in turn, each either a string or an object
+// with a message, skipping one that is empty or only whitespace, then falls
+// back to the raw body.
+// TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
+// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
+// result is capped at maxMessageBytes on every path.
 func extractMessage(body []byte) string {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -398,25 +403,21 @@ func extractMessage(body []byte) string {
 	}
 	var env struct {
 		Error   json.RawMessage `json:"error"`
-		Detail  string          `json:"detail"`
-		Message string          `json:"message"`
+		Detail  json.RawMessage `json:"detail"`
+		Message json.RawMessage `json:"message"`
 	}
 	if err := json.Unmarshal(trimmed, &env); err == nil {
-		if m := messageFromError(env.Error); m != "" {
-			return m
-		}
-		if env.Detail != "" {
-			return env.Detail
-		}
-		if env.Message != "" {
-			return env.Message
+		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), messageFromError(env.Message)} {
+			if strings.TrimSpace(m) != "" {
+				return truncateMessage([]byte(m))
+			}
 		}
 	}
 	return truncateMessage(trimmed)
 }
 
-// messageFromError reads an "error" field that may be an object with a message
-// or a bare string.
+// messageFromError reads an "error", "detail", or "message" field that may be
+// an object with a message or a bare string. Any other shape yields "".
 func messageFromError(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
