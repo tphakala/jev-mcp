@@ -182,20 +182,7 @@ func TestServeHTTPShutsDownOnCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- ServeHTTP(ctx, Deps{}, addr, "") }()
 
-	url := "http://" + addr
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		req := postJSON(t, url, `{}`)
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server never answered: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitListening(t, addr, done)
 
 	cancel()
 	select {
@@ -218,14 +205,43 @@ func TestServeHTTPBindFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	// Bounded, so a regression that binds after all fails instead of serving
-	// until the package timeout.
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	// In production the context never expires, so ServeHTTP must return on
+	// the bind error by itself. The deadline only stops a regression from
+	// hanging the package; returning because of it is a failure too.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	start := time.Now()
 	err = ServeHTTP(ctx, Deps{}, ln.Addr().String(), "")
 	if err == nil {
-		t.Fatalf("ServeHTTP on a taken port = nil after %v, want a bind error", time.Since(start))
+		t.Fatal("ServeHTTP on a taken port = nil, want a bind error")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("ServeHTTP returned only after the test deadline: %v", err)
+	}
+}
+
+// waitListening waits until addr accepts TCP connections. It fails at once
+// if the server has already returned (done delivers its error), and bounds
+// each dial, so a bind failure is reported as itself rather than as a
+// timeout.
+func waitListening(t *testing.T, addr string, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("server returned before listening: %v", err)
+		default:
+		}
+		d := net.Dialer{Timeout: time.Second}
+		conn, err := d.DialContext(t.Context(), "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server never listened on %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -395,21 +411,8 @@ func TestServeHTTPShutdownWithOpenSession(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- ServeHTTP(ctx, Deps{Client: eval, Logger: logger}, addr, "") }()
 
-	var cs *mcp.ClientSession
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		client := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil)
-		var err error
-		cs, err = client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: "http://" + addr}, nil)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("connect: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Cleanup(func() { _ = cs.Close() })
+	waitListening(t, addr, done)
+	cs := connectHTTP(t, "http://"+addr, nil)
 	callErr := make(chan error, 1)
 	go func() {
 		res, err := cs.CallTool(t.Context(), oneNoulCall())

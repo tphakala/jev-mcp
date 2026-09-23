@@ -371,13 +371,21 @@ func TestEvaluateLogsWithoutContent(t *testing.T) {
 	args := map[string]any{"state": markerState, "questions": []any{
 		map[string]any{"name": "q", "type": "noul", "instructions": markerInstr},
 	}}
+	// A result whose legend is not valid JSON cannot occur from a real
+	// decode, but it is the one way to make rendering fail after the client
+	// has answered, which must be logged as a failure, not a success.
+	unrenderable := &jev.Result{Model: "m", Answers: map[string]jev.Answer{
+		"q": {Type: jev.TypeScore, Score: new(1.0), Legend: map[string]json.RawMessage{"0": json.RawMessage("{")}},
+	}}
 	tests := []struct {
-		name    string
-		fake    *fakeEvaluator
-		wantMsg string
+		name      string
+		fake      *fakeEvaluator
+		wantMsg   string
+		wantLevel string
 	}{
-		{name: "success", fake: &fakeEvaluator{res: resultFrom(t, mixedResponse)}, wantMsg: logMsgEvaluated},
-		{name: "failure", fake: &fakeEvaluator{err: errors.New("provider down")}, wantMsg: logMsgFailed},
+		{name: "success", fake: &fakeEvaluator{res: resultFrom(t, mixedResponse)}, wantMsg: logMsgEvaluated, wantLevel: "level=INFO"},
+		{name: "client failure", fake: &fakeEvaluator{err: errors.New("provider down")}, wantMsg: logMsgFailed, wantLevel: "level=WARN"},
+		{name: "render failure", fake: &fakeEvaluator{res: unrenderable}, wantMsg: logMsgFailed, wantLevel: "level=WARN"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -386,8 +394,8 @@ func TestEvaluateLogsWithoutContent(t *testing.T) {
 			logger := slog.New(slog.NewTextHandler(&logs, nil))
 			callEvaluate(t, connect(t, Deps{Client: tt.fake, Logger: logger}), args)
 			got := logs.String()
-			if strings.Count(got, "msg=") != 1 || !strings.Contains(got, tt.wantMsg) {
-				t.Errorf("logs = %q, want exactly one %q record", got, tt.wantMsg)
+			if strings.Count(got, "msg=") != 1 || !strings.Contains(got, tt.wantMsg) || !strings.Contains(got, tt.wantLevel) {
+				t.Errorf("logs = %q, want exactly one %s %q record", got, tt.wantLevel, tt.wantMsg)
 			}
 			for _, marker := range []string{markerState, markerInstr} {
 				if strings.Contains(got, marker) {
@@ -594,6 +602,28 @@ func TestToRequestRejectsInvalidDetail(t *testing.T) {
 	}
 }
 
+// TestDescriptionsQuoteJevLimits pins that every description quoting a limit
+// is built from the jev constant, so a changed limit cannot leave the text
+// stale.
+func TestDescriptionsQuoteJevLimits(t *testing.T) {
+	t.Parallel()
+
+	s := evaluateInputSchema()
+	q := s.Properties["questions"].Items.Properties
+	checks := []struct{ what, desc, want string }{
+		{"questions", s.Properties["questions"].Description, fmt.Sprintf("1 to %d per call", jev.MaxQuestions)},
+		{"name", q["name"].Description, fmt.Sprintf("at most %d bytes", jev.MaxQuestionNameBytes)},
+		{"criteria", q["criteria"].Description, fmt.Sprintf("%d to %d options", jev.MinChoiceOptions, jev.MaxChoiceOptions)},
+		{"criteria", q["criteria"].Description, fmt.Sprintf("%d to %d level descriptions", jev.MinScoreLevels, jev.MaxScoreLevels)},
+		{"tool", evaluateDescription, fmt.Sprintf("%d to %d levels", jev.MinScoreLevels, jev.MaxScoreLevels)},
+	}
+	for _, c := range checks {
+		if !strings.Contains(c.desc, c.want) {
+			t.Errorf("%s description %q does not quote %q", c.what, c.desc, c.want)
+		}
+	}
+}
+
 // TestEvaluateInputSchema pins what the derived schema cannot express on its
 // own: explicit JSON types for the union-typed fields (an interface field is
 // otherwise rendered with no type), the enums, and the question bounds.
@@ -627,8 +657,9 @@ func TestEvaluateInputSchema(t *testing.T) {
 					Required   []string `json:"required"`
 					Properties struct {
 						Name struct {
-							MinLength int `json:"minLength"`
-							MaxLength int `json:"maxLength"`
+							MinLength   int    `json:"minLength"`
+							MaxLength   int    `json:"maxLength"`
+							Description string `json:"description"`
 						} `json:"name"`
 						Type struct {
 							Enum []string `json:"enum"`
@@ -670,17 +701,6 @@ func TestEvaluateInputSchema(t *testing.T) {
 	}
 	if p.Questions.Type != "array" {
 		t.Errorf("questions type = %q, want array (not nullable)", p.Questions.Type)
-	}
-	if want := fmt.Sprintf("1 to %d per call", jev.MaxQuestions); !strings.Contains(p.Questions.Description, want) {
-		t.Errorf("questions description %q does not quote the limit %q", p.Questions.Description, want)
-	}
-	for _, want := range []string{
-		fmt.Sprintf("%d to %d options", jev.MinChoiceOptions, jev.MaxChoiceOptions),
-		fmt.Sprintf("%d to %d level descriptions", jev.MinScoreLevels, jev.MaxScoreLevels),
-	} {
-		if !strings.Contains(q.Criteria.Description, want) {
-			t.Errorf("criteria description %q does not quote %q", q.Criteria.Description, want)
-		}
 	}
 	if p.Questions.MinItems != 1 || p.Questions.MaxItems != jev.MaxQuestions {
 		t.Errorf("questions items bounds = %d..%d, want 1..%d", p.Questions.MinItems, p.Questions.MaxItems, jev.MaxQuestions)

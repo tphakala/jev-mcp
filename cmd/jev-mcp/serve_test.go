@@ -228,6 +228,7 @@ func TestServeCommandWiresConfig(t *testing.T) {
 		env      map[string]string
 		handler  func(w http.ResponseWriter, r *http.Request)
 		wantHits int
+		minTime  time.Duration
 		maxTime  time.Duration
 	}{
 		{
@@ -251,6 +252,7 @@ func TestServeCommandWiresConfig(t *testing.T) {
 				<-r.Context().Done()
 			},
 			wantHits: 1,
+			minTime:  250 * time.Millisecond,
 			maxTime:  3 * time.Second,
 		},
 	}
@@ -288,8 +290,13 @@ func TestServeCommandWiresConfig(t *testing.T) {
 			if !res.IsError {
 				t.Fatalf("call succeeded, want a provider error")
 			}
-			if took > tt.maxTime {
-				t.Errorf("call took %v, want under %v", took, tt.maxTime)
+			if took < tt.minTime || took > tt.maxTime {
+				t.Errorf("call took %v, want between %v and %v", took, tt.minTime, tt.maxTime)
+			}
+			// The failure is logged through the logger serveCommand built,
+			// which is what reaches stderr.
+			if got := s.stderr.String(); !strings.Contains(got, "jev_evaluate failed") {
+				t.Errorf("stderr %q does not carry the tool failure record", got)
 			}
 			mu.Lock()
 			defer mu.Unlock()
