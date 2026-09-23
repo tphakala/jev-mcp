@@ -21,7 +21,7 @@ import (
 const mixedResponse = `{"model":"jev-1.13.0","answers":{` +
 	`"route":{"type":"choice","choice":"billing","confidence":0.87341,"probabilities":{"billing":0.87341,"tech":0.12659}},` +
 	`"severity":{"type":"score","score":1.23456,"confidence":0.6,"probabilities":{"0":0.1,"1":0.5,"2":0.4},"legend":{"0":"low","1":{"what":"medium"},"2":"high"}},` +
-	`"spam":{"type":"noul","noul":0.01234,"confidence":0.9},` +
+	`"spam":{"type":"noul","noul":0.01234},` +
 	`"future":{"type":"rank","order":["a","b"]}},` +
 	`"usage":{"input_tokens":120,"output_tokens":4,"cost":0.00012}}`
 
@@ -139,7 +139,7 @@ func assertChoiceAndScore(t *testing.T, route, severity *answerOutput) {
 func assertNoulAndRaw(t *testing.T, answers []answerOutput) {
 	t.Helper()
 	route, severity, spam, future := &answers[0], &answers[1], &answers[2], &answers[3]
-	if spam.Type != "noul" || spam.Noul == nil || *spam.Noul != 0.01234 || spam.Confidence == nil || *spam.Confidence != 0.9 {
+	if spam.Type != "noul" || spam.Noul == nil || *spam.Noul != 0.01234 || spam.Confidence != nil {
 		t.Errorf("spam = %+v", spam)
 	}
 	if route.Raw != nil || severity.Raw != nil || spam.Raw != nil {
@@ -290,6 +290,13 @@ func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 			wantRaw:  true,
 		},
 		{
+			// Jev sends no confidence for noul; if one arrives, the summary
+			// still shows only the probability, which is its own certainty.
+			name:     "noul with an unexpected confidence",
+			answer:   `{"type":"noul","noul":0.25,"confidence":0.9}`,
+			wantText: `{"answers":[{"name":"q","noul":0.25}]}`,
+		},
+		{
 			name:     "score without confidence",
 			answer:   `{"type":"score","score":1.5}`,
 			wantText: `{"answers":[{"name":"q","score":1.5}]}`,
@@ -319,16 +326,21 @@ func TestEvaluateUnreadableAndEdgeAnswers(t *testing.T) {
 			if len(out.Answers) != 1 {
 				t.Fatalf("got %d answers, want 1", len(out.Answers))
 			}
-			if gotRaw := out.Answers[0].Raw != nil; gotRaw != tt.wantRaw {
+			a := out.Answers[0]
+			if gotRaw := a.Raw != nil; gotRaw != tt.wantRaw {
 				t.Errorf("structured raw present = %v, want %v", gotRaw, tt.wantRaw)
+			}
+			typed := a.Choice != "" || a.Score != nil || a.Noul != nil || a.Confidence != nil || a.Probabilities != nil || a.Legend != nil
+			if tt.wantRaw && typed {
+				t.Errorf("unreadable answer carries typed fields beside raw: %+v", a)
 			}
 		})
 	}
 }
 
 // TestEvaluateAcceptsNullNoulCriteria pins that a noul question may pass
-// criteria as null, which jev.Validate accepts, and that it reaches Jev as
-// null rather than being dropped or rejected by the schema.
+// criteria as null, and that null is treated as omitted: it is not sent to
+// Jev, whose wire form for an absent criteria is no key at all.
 func TestEvaluateAcceptsNullNoulCriteria(t *testing.T) {
 	t.Parallel()
 
@@ -344,8 +356,8 @@ func TestEvaluateAcceptsNullNoulCriteria(t *testing.T) {
 	if len(reqs) != 1 {
 		t.Fatalf("got %d requests, want 1", len(reqs))
 	}
-	if got := string(reqs[0].Questions["spam"].Criteria); got != "null" {
-		t.Fatalf("criteria = %q, want null", got)
+	if c := reqs[0].Questions["spam"].Criteria; c != nil {
+		t.Fatalf("criteria = %q, want absent", c)
 	}
 }
 
@@ -383,6 +395,62 @@ func TestEvaluateLogsWithoutContent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestEvaluateDuplicateQuestionsKey pins that a repeated questions key cannot
+// merge fields from the first copy into the second. The SDK validates only
+// the last copy, so a criteria it never saw must not reach Jev.
+func TestEvaluateDuplicateQuestionsKey(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeEvaluator{res: resultFrom(t, mixedResponse)}
+	const args = `{"state":"s",` +
+		`"questions":[{"name":"a","type":"choice","instructions":"i","criteria":"NOT-VALIDATED"}],` +
+		`"questions":[{"name":"b","type":"noul","instructions":"i"}]}`
+	res, err := connect(t, Deps{Client: fake}).CallTool(t.Context(), &mcp.CallToolParams{Name: toolEvaluate, Arguments: json.RawMessage(args)})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %s", resultText(t, res))
+	}
+	reqs := fake.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1", len(reqs))
+	}
+	if c := reqs[0].Questions["b"].Criteria; c != nil {
+		t.Fatalf("question b criteria = %s, want absent (leaked from the first questions key)", c)
+	}
+}
+
+// TestRawInputMirrorsSchemaInput guards the two views of the tool input
+// against drift: every JSON field the schema advertises (evaluateInput,
+// questionInput) must be decoded by the handler (rawEnvelope, rawQuestion),
+// and the other way round.
+func TestRawInputMirrorsSchemaInput(t *testing.T) {
+	t.Parallel()
+
+	jsonNames := func(v any) []string {
+		rt := reflect.TypeOf(v)
+		names := make([]string, 0, rt.NumField())
+		for f := range rt.Fields() {
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	for _, c := range []struct {
+		what         string
+		schema, read any
+	}{
+		{"call", evaluateInput{}, rawEnvelope{}},
+		{"question", questionInput{}, rawQuestion{}},
+	} {
+		if got, want := jsonNames(c.read), jsonNames(c.schema); !slices.Equal(got, want) {
+			t.Errorf("%s fields decoded %v, schema advertises %v", c.what, got, want)
+		}
 	}
 }
 

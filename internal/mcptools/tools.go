@@ -5,6 +5,7 @@
 package mcptools
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -224,18 +225,59 @@ type rawQuestion struct {
 }
 
 type rawInput struct {
-	State     json.RawMessage `json:"state"`
-	Questions []rawQuestion   `json:"questions"`
-	Model     string          `json:"model,omitempty"`
-	Detail    string          `json:"detail,omitempty"`
+	State     json.RawMessage
+	Questions []rawQuestion
+	Model     string
+	Detail    string
+}
+
+// rawEnvelope is the wire shape rawInput is decoded from. Questions stay raw
+// here and are decoded one by one into fresh values: encoding/json decodes a
+// repeated key into the slice it already filled, so a field the last copy of
+// questions omits would otherwise keep the first copy's value, while the SDK
+// validated only the last copy.
+type rawEnvelope struct {
+	State     json.RawMessage   `json:"state"`
+	Questions []json.RawMessage `json:"questions"`
+	Model     string            `json:"model,omitempty"`
+	Detail    string            `json:"detail,omitempty"`
+}
+
+// jsonNullLiteral is the JSON null token.
+var jsonNullLiteral = []byte("null")
+
+// decodeRawInput decodes the tool arguments into a rawInput. A null criteria
+// is treated as omitted, so it is not sent to Jev; the schema accepts null
+// for callers that spell an absent value that way.
+func decodeRawInput(args json.RawMessage) (rawInput, error) {
+	var env rawEnvelope
+	if err := json.Unmarshal(args, &env); err != nil {
+		return rawInput{}, err
+	}
+	in := rawInput{
+		State:     env.State,
+		Model:     env.Model,
+		Detail:    env.Detail,
+		Questions: make([]rawQuestion, len(env.Questions)),
+	}
+	for i, raw := range env.Questions {
+		q := &in.Questions[i]
+		if err := json.Unmarshal(raw, q); err != nil {
+			return rawInput{}, fmt.Errorf("question %d: %w", i, err)
+		}
+		if bytes.Equal(bytes.TrimSpace(q.Criteria), jsonNullLiteral) {
+			q.Criteria = nil
+		}
+	}
+	return in, nil
 }
 
 // evaluate is the jev_evaluate handler. The typed input exists for the SDK's
 // schema validation; the request is built from the raw arguments (see
 // rawInput).
 func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluateInput) (*mcp.CallToolResult, evaluateOutput, error) {
-	var in rawInput
-	if err := json.Unmarshal(call.Params.Arguments, &in); err != nil {
+	in, err := decodeRawInput(call.Params.Arguments)
+	if err != nil {
 		return nil, evaluateOutput{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
 	}
 	detail, req, err := d.toRequest(&in)
@@ -244,9 +286,7 @@ func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluat
 	}
 	res, err := d.Client.Evaluate(ctx, req)
 	if err != nil {
-		d.Logger.WarnContext(ctx, logMsgFailed,
-			slog.Int("questions", len(req.Questions)),
-			slog.String("error", err.Error()))
+		d.logFailed(ctx, len(req.Questions), err)
 		return nil, evaluateOutput{}, err
 	}
 	names := questionNames(in.Questions)
@@ -256,9 +296,7 @@ func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluat
 		text, err = summaryText(res, names)
 	}
 	if err != nil {
-		d.Logger.WarnContext(ctx, logMsgFailed,
-			slog.Int("questions", len(req.Questions)),
-			slog.String("error", err.Error()))
+		d.logFailed(ctx, len(req.Questions), err)
 		return nil, evaluateOutput{}, err
 	}
 	d.Logger.InfoContext(ctx, logMsgEvaluated,
@@ -273,6 +311,14 @@ func (d Deps) evaluate(ctx context.Context, call *mcp.CallToolRequest, _ evaluat
 		return nil, out, nil
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+}
+
+// logFailed records a call that reached the Jev client and then failed. Only
+// the question count and the error are logged, never request content.
+func (d Deps) logFailed(ctx context.Context, questions int, err error) {
+	d.Logger.WarnContext(ctx, logMsgFailed,
+		slog.Int("questions", questions),
+		slog.String("error", err.Error()))
 }
 
 // toRequest rejects what the schema cannot express (a duplicate question
@@ -373,15 +419,21 @@ func toOutput(res *jev.Result, asked []string) (evaluateOutput, error) {
 	}
 	for _, name := range orderedAnswerNames(res.Answers, asked) {
 		a := res.Answers[name]
-		ao := answerOutput{
-			Name:          name,
-			Type:          string(a.Type),
-			Choice:        a.Choice,
-			Score:         a.Score,
-			Noul:          a.Noul,
-			Confidence:    a.Confidence,
-			Probabilities: a.Probabilities,
+		ao := answerOutput{Name: name, Type: string(a.Type)}
+		if !readable(&a) {
+			// Like the summary, an answer this server cannot read carries only
+			// its verbatim form, not whichever typed fields happened to decode.
+			if err := json.Unmarshal(a.Raw, &ao.Raw); err != nil {
+				return evaluateOutput{}, fmt.Errorf("%w: answer %q: %w", jev.ErrMalformedResponse, name, err)
+			}
+			out.Answers = append(out.Answers, ao)
+			continue
 		}
+		ao.Choice = a.Choice
+		ao.Score = a.Score
+		ao.Noul = a.Noul
+		ao.Confidence = a.Confidence
+		ao.Probabilities = a.Probabilities
 		if len(a.Legend) > 0 {
 			ao.Legend = make(map[string]any, len(a.Legend))
 			for k, raw := range a.Legend {
@@ -390,11 +442,6 @@ func toOutput(res *jev.Result, asked []string) (evaluateOutput, error) {
 					return evaluateOutput{}, fmt.Errorf("%w: answer %q legend %q: %w", jev.ErrMalformedResponse, name, k, err)
 				}
 				ao.Legend[k] = v
-			}
-		}
-		if !readable(&a) {
-			if err := json.Unmarshal(a.Raw, &ao.Raw); err != nil {
-				return evaluateOutput{}, fmt.Errorf("%w: answer %q: %w", jev.ErrMalformedResponse, name, err)
 			}
 		}
 		out.Answers = append(out.Answers, ao)
