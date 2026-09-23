@@ -69,8 +69,8 @@ type Deps struct {
 	Client Evaluator
 	// DefaultModel is used when a call omits model.
 	DefaultModel string
-	// Logger receives one record for each call that reaches the Jev client. A
-	// nil Logger discards.
+	// Logger receives a record for each call that reaches the Jev client and,
+	// in HTTP mode, the transport's own records. A nil Logger discards.
 	Logger *slog.Logger
 }
 
@@ -91,7 +91,7 @@ type questionInput struct {
 type evaluateInput struct {
 	State     any             `json:"state" jsonschema:"the program state to decide over: a string, or a JSON object or array whose named parts give the model context. Every question is evaluated against this same state in one parallel pass. Text only"`
 	Questions []questionInput `json:"questions"`
-	Model     string          `json:"model,omitempty" jsonschema:"Jev model id: jev-latest, jev-preview, or a pinned version (jev-1.13.0 on TypeSafe, jev-1.13 on OpenRouter). Omit to use the server default"`
+	Model     string          `json:"model,omitempty" jsonschema:"Jev model id, such as jev-latest or jev-preview. Omit to use the server default"`
 	Detail    string          `json:"detail,omitempty" jsonschema:"how much the text result shows: summary (the default) gives each answer with its confidence; full also gives probabilities, legend, provider, model, usage, and latency. The structured result always carries everything"`
 }
 
@@ -119,7 +119,7 @@ type usageOutput struct {
 type evaluateOutput struct {
 	Provider  string         `json:"provider" jsonschema:"the backend that answered, typesafe or openrouter, after any fallback"`
 	Model     string         `json:"model" jsonschema:"the model id the provider reports"`
-	Answers   []answerOutput `json:"answers" jsonschema:"the answers the provider returned, in the order the questions were given; a question the provider did not answer is absent"`
+	Answers   []answerOutput `json:"answers" jsonschema:"the answers the provider returned, in the order the questions were given, followed by any answer for a name that was not asked, sorted by name; a question the provider did not answer is absent"`
 	Usage     usageOutput    `json:"usage" jsonschema:"token accounting for this call"`
 	LatencyMS int64          `json:"latency_ms" jsonschema:"wall-clock milliseconds of the provider call that answered"`
 	Attempts  int            `json:"attempts" jsonschema:"HTTP attempts made across retries and fallback; 1 is the normal case"`
@@ -128,13 +128,13 @@ type evaluateOutput struct {
 // annDecide: the tool writes nothing anywhere, so readOnlyHint is literal, and
 // it reaches a paid external API, so the world is open. destructiveHint and
 // idempotentHint are meaningful only when readOnlyHint is false (see
-// mcp.ToolAnnotations), so they are left unset.
+// mcp.ToolAnnotations), so neither is set here.
 var annDecide = &mcp.ToolAnnotations{
 	ReadOnlyHint:  true,
 	OpenWorldHint: new(true),
 }
 
-const serverInstructions = `jev-mcp gives you typed, probabilistic decisions from Jev, a fast non-generative model: you pass a state and one or more questions and get back answers shaped by the criteria you defined. A choice answer is always one of your options; score and noul answers are numbers on the scale you defined. It does not write text.
+const serverInstructions = `jev-mcp gives you typed, probabilistic decisions from Jev, a fast non-generative model: you pass a state and one or more questions with criteria you define, and get back typed answers with probabilities. It does not write text.
 
 Use jev_evaluate for routing, classification, triage, gating, and scoring: "which of these options fits", "where on this scale", "is this true". It typically answers in under a second and costs far less than a language-model call, so it suits decisions made many times or inside a loop. Do not use it to generate, summarise, or explain.
 
@@ -152,9 +152,9 @@ func NewServer(d Deps) *mcp.Server {
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.DiscardHandler)
 	}
-	// ServerOptions.Logger stays unset, so the SDK discards its own records:
-	// they are preformatted strings, and a normal shutdown is logged at Error
-	// ("server run cancelled", go-sdk v1.8.0 mcp/server.go Server.Run).
+	// ServerOptions.Logger stays unset, so the SDK discards its own records: it
+	// logs a normal shutdown at Error ("server run cancelled", go-sdk v1.8.0
+	// mcp/server.go Server.Run).
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "jev-mcp", Version: jevmcp.Version},
 		&mcp.ServerOptions{Instructions: serverInstructions},
@@ -210,13 +210,13 @@ func evaluateInputSchema() *jsonschema.Schema {
 
 // rawQuestion and rawInput mirror questionInput and evaluateInput with the
 // union-typed fields kept as raw JSON. The SDK decodes the arguments into a
-// map[string]any and marshals them again before validating them (go-sdk
-// v1.8.0 mcp/tool.go applySchema), which turns every JSON number into a
-// float64 and re-sorts object keys, so an integer above 2^53 in state would
+// map[string]any, validates it, and marshals it again for the typed input
+// (go-sdk v1.8.0 mcp/tool.go applySchema), which turns every JSON number into
+// a float64 and re-sorts object keys, so an integer above 2^53 in state would
 // reach Jev rounded. The handler therefore builds the request from the
 // arguments as the client sent them (CallToolParamsRaw.Arguments), after the
 // SDK has validated them against the input schema. The schema declares no
-// defaults, so the raw arguments carry everything the validated input does.
+// defaults, so reading the raw arguments loses nothing the SDK would add.
 type rawQuestion struct {
 	Name         string          `json:"name"`
 	Type         string          `json:"type"`
@@ -387,10 +387,10 @@ func orderedAnswerNames(answers map[string]jev.Answer, asked []string) []string 
 
 // readable reports whether a carries the decision for its type: a choice with
 // an option, a score or a noul with its number. It is false for a type this
-// server does not model, and for a known type whose fields failed to decode,
-// which jev.Response.UnmarshalJSON reports by keeping only Type and Raw. Such
-// an answer is passed through verbatim instead of being shown as a decision
-// with no value.
+// server does not model, and for a known type whose value is missing or whose
+// fields failed to decode (jev.Response.UnmarshalJSON then keeps only Type and
+// Raw). Such an answer is passed through verbatim instead of being shown as a
+// decision with no value.
 func readable(a *jev.Answer) bool {
 	switch a.Type {
 	case jev.TypeChoice:
@@ -461,7 +461,8 @@ type summaryAnswer struct {
 }
 
 // summaryText renders the compact text result: each answer's decision and
-// confidence, in input order, with numbers rounded to summaryPrecision places.
+// confidence, in the order of the answers field, with numbers rounded to
+// summaryPrecision places.
 // An answer that is not readable is shown verbatim under raw.
 func summaryText(res *jev.Result, asked []string) (string, error) {
 	answers := make([]summaryAnswer, 0, len(res.Answers))

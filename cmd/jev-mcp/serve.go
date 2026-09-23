@@ -93,8 +93,10 @@ func serveCommand(ctx context.Context, opts serveOptions, getenv func(string) st
 }
 
 // isShutdown reports whether a stdio serve error is an ordinary end of
-// session: the client closed its end of the pipe, or the process was asked to
-// stop.
+// session. A cancelled context (SIGTERM) returns context.Canceled. A client
+// that closes its end of the pipe normally ends the session with a nil error;
+// io.EOF is accepted as well so a transport that reports the hang-up that way
+// is not treated as a failure.
 func isShutdown(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, context.Canceled)
 }

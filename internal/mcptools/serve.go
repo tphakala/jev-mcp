@@ -53,10 +53,12 @@ func (f evaluatorFunc) Evaluate(ctx context.Context, req jev.Request) (*jev.Resu
 }
 
 // withStop returns d with its client wrapped so every evaluation is also
-// cancelled when ctx is. Over stdio the SDK detaches handler contexts from the
-// serve context (go-sdk v1.8.0 internal/jsonrpc2/conn.go NewConnection wraps it
-// in notDone unless cancellation propagation is on), so without this a
-// shutdown waits for an in-flight evaluation to finish.
+// cancelled when ctx is. The SDK detaches tool handler contexts from the serve
+// context unless cancellation propagation is on (go-sdk v1.8.0
+// internal/jsonrpc2/conn.go NewConnection wraps it in notDone), and neither the
+// stdio transport nor a stateful HTTP session turns it on (mcp/streamable.go
+// sets it only for stateless requests), so without this a shutdown waits for
+// an in-flight evaluation to finish.
 func withStop(ctx context.Context, d Deps) Deps {
 	if d.Client == nil {
 		return d
@@ -129,8 +131,8 @@ func unauthorized(w http.ResponseWriter) {
 // ServeHTTP runs the Streamable HTTP server on addr until ctx is cancelled. A
 // non-empty token requires Authorization: Bearer <token> on every request.
 //
-// Every request runs under ctx, so cancelling it ends open event streams and
-// in-flight evaluations; the server then shuts down, waiting up to
+// Every request runs under ctx, so cancelling it ends open event streams;
+// withStop cancels in-flight evaluations. The server then shuts down, waiting up to
 // shutdownTimeout for handlers to return before closing their connections.
 func ServeHTTP(ctx context.Context, d Deps, addr, token string) error {
 	logger := d.Logger

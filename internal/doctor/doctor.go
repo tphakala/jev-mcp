@@ -230,7 +230,7 @@ func defaultModelCheck(model string) check {
 	if defaultModelPattern.MatchString(model) {
 		return check{statusPass, "default model", model}
 	}
-	return check{statusWarn, "default model", fmt.Sprintf("%q does not look like a Jev model id (expected e.g. jev-latest or jev-1.13)", model)}
+	return check{statusWarn, "default model", fmt.Sprintf("%q does not look like a Jev model id (expected e.g. jev-latest)", model)}
 }
 
 // httpTokenCheck reports whether the HTTP bearer token is set. It is

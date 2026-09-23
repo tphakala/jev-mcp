@@ -231,8 +231,8 @@ func TestServeCommandWiresConfig(t *testing.T) {
 		maxTime  time.Duration
 	}{
 		{
-			// One 500 and no retries: the call fails after a single attempt.
-			// The default of two retries would retry and succeed.
+			// A provider that always returns 500, with no retries: one attempt.
+			// The default of two retries would make three.
 			name: "max retries and default model",
 			env:  map[string]string{config.EnvMaxRetries: "0", config.EnvDefaultModel: "jev-wired"},
 			handler: func(w http.ResponseWriter, _ *http.Request) {
@@ -305,8 +305,8 @@ func TestServeCommandWiresConfig(t *testing.T) {
 	}
 }
 
-// TestServeCommandStdioCancel checks that a cancelled context (SIGTERM) ends an
-// idle stdio session with exit 0.
+// TestServeCommandStdioCancel checks that a cancelled context (SIGTERM) ends
+// the stdio session with exit 0, even before any client has connected.
 func TestServeCommandStdioCancel(t *testing.T) {
 	t.Parallel()
 
