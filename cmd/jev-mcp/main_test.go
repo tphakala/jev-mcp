@@ -20,7 +20,7 @@ func TestRun(t *testing.T) {
 		wantStderr string
 	}{
 		{name: "version", args: []string{"-version"}, wantCode: exitOK, wantStdout: "jev-mcp " + jevmcp.Version},
-		{name: "no command", args: nil, wantCode: exitUsage, wantStderr: "no command given"},
+		{name: "bad log level", args: []string{"-log-level", "loud"}, wantCode: exitUsage, wantStderr: "invalid value"},
 		{name: "unknown flag", args: []string{"-bogus"}, wantCode: exitUsage, wantStderr: "flag provided but not defined: -bogus"},
 		{name: "positional argument", args: []string{"extra"}, wantCode: exitUsage, wantStderr: `unexpected argument "extra"`},
 		// These reach doctorCommand and fail in its flag parsing, before any

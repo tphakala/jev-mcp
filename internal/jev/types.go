@@ -1,5 +1,5 @@
 // Package jev is the client for TypeSafe's Jev decision API. It owns the wire
-// types, request validation, and (in later changes) the HTTP client with retry
+// types, request validation, and the HTTP client with retry
 // and provider fallback. It knows the wire format and nothing about the
 // process environment or MCP.
 //
