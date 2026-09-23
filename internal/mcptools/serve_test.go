@@ -3,15 +3,20 @@ package mcptools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/tphakala/jev-mcp/internal/jev"
 )
 
 // postJSON builds a JSON POST bound to the test's context.
@@ -272,8 +277,8 @@ func TestServeStdio(t *testing.T) {
 	}
 }
 
-// TestServeStdioStopsOnCancel checks that cancelling the context ends a
-// session whose client is connected but idle, which is what SIGTERM does.
+// TestServeStdioStopsOnCancel checks that cancelling the context ends the
+// session even before any client has connected.
 func TestServeStdioStopsOnCancel(t *testing.T) {
 	t.Parallel()
 
@@ -292,4 +297,159 @@ func TestServeStdioStopsOnCancel(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("ServeStdio did not return after cancel")
 	}
+}
+
+// blockingEvaluator blocks every call until its context ends, reporting the
+// start of the call on started and the context error on ended.
+type blockingEvaluator struct {
+	started chan struct{}
+	ended   chan error
+}
+
+func newBlockingEvaluator() *blockingEvaluator {
+	return &blockingEvaluator{started: make(chan struct{}, 1), ended: make(chan error, 1)}
+}
+
+func (b *blockingEvaluator) Evaluate(ctx context.Context, _ jev.Request) (*jev.Result, error) {
+	b.started <- struct{}{}
+	<-ctx.Done()
+	b.ended <- ctx.Err()
+	return nil, ctx.Err()
+}
+
+// oneNoulCall returns a minimal valid jev_evaluate call. It is built fresh
+// for every call because the SDK client records the negotiated protocol
+// version in the params' _meta and keeps one already there (go-sdk v1.8.0
+// mcp/client.go), so a shared value carries one session's version into
+// another.
+func oneNoulCall() *mcp.CallToolParams {
+	return &mcp.CallToolParams{Name: toolEvaluate, Arguments: map[string]any{
+		"state":     "s",
+		"questions": []any{map[string]any{"name": "q", "type": "noul", "instructions": "q"}},
+	}}
+}
+
+// waitFor fails the test if ch does not deliver within d.
+func waitFor[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatalf("timed out after %v waiting for %s", d, what)
+		var zero T
+		return zero
+	}
+}
+
+// TestServeStdioCancelsInFlightCall checks that cancelling the serve context
+// (SIGTERM) cancels an evaluation in flight, so shutdown does not wait out the
+// call budget.
+func TestServeStdioCancelsInFlightCall(t *testing.T) {
+	t.Parallel()
+
+	serverIn, clientOut := io.Pipe()
+	clientIn, serverOut := io.Pipe()
+	t.Cleanup(func() { _ = clientOut.Close(); _ = serverOut.Close() })
+	eval := newBlockingEvaluator()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- ServeStdio(ctx, Deps{Client: eval}, serverIn, serverOut) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	cs, err := client.Connect(t.Context(), &mcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	go func() { _, _ = cs.CallTool(t.Context(), oneNoulCall()) }()
+	waitFor(t, eval.started, 5*time.Second, "the evaluation to start")
+
+	cancel()
+	if err := waitFor(t, eval.ended, 2*time.Second, "the evaluation to be cancelled"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("evaluation context ended with %v, want context.Canceled", err)
+	}
+	if err := waitFor(t, done, 2*time.Second, "ServeStdio to return"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServeStdio = %v, want context.Canceled", err)
+	}
+}
+
+// TestServeHTTPShutdownWithOpenSession checks that cancelling the context
+// stops the server promptly while a client holds a session open and a call is
+// in flight: the event stream and the evaluation both end, and shutdown does
+// not run into its timeout.
+func TestServeHTTPShutdownWithOpenSession(t *testing.T) {
+	t.Parallel()
+
+	addr := freeLoopbackAddr(t)
+	eval := newBlockingEvaluator()
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- ServeHTTP(ctx, Deps{Client: eval, Logger: logger}, addr, "") }()
+
+	var cs *mcp.ClientSession
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+		var err error
+		cs, err = client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: "http://" + addr}, nil)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connect: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	callErr := make(chan error, 1)
+	go func() {
+		res, err := cs.CallTool(t.Context(), oneNoulCall())
+		if err == nil && res.IsError {
+			err = fmt.Errorf("tool error: %v", res.Content)
+		}
+		callErr <- err
+	}()
+	select {
+	case <-eval.started:
+	case err := <-callErr:
+		t.Fatalf("call returned before the evaluation started: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the evaluation to start")
+	}
+
+	start := time.Now()
+	cancel()
+	if err := waitFor(t, eval.ended, 2*time.Second, "the evaluation to be cancelled"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("evaluation context ended with %v, want context.Canceled", err)
+	}
+	if err := waitFor(t, done, shutdownTimeout+5*time.Second, "ServeHTTP to return"); err != nil {
+		t.Fatalf("ServeHTTP = %v, want nil", err)
+	}
+	if took := time.Since(start); took >= shutdownTimeout {
+		t.Errorf("shutdown took %v, want well under the %v timeout", took, shutdownTimeout)
+	}
+	if strings.Contains(logs.String(), logMsgShutdown) {
+		t.Errorf("shutdown logged a failure: %s", logs.String())
+	}
+}
+
+// syncBuffer is a strings.Builder safe for concurrent writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
