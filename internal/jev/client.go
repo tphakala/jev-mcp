@@ -35,8 +35,13 @@ const (
 	// defaultCallBudget is the whole-call timeout when [WithBudget] is not given.
 	defaultCallBudget = 30 * time.Second
 
-	// maxMessageBytes bounds the best-effort error message taken from a body.
+	// maxMessageBytes bounds the best-effort error message taken from a body,
+	// and every other provider-supplied text [CleanText] returns.
 	maxMessageBytes = 512
+
+	// maxErrorTypeBytes bounds an error_type kept as a message prefix, so a
+	// long one cannot push the message itself out of maxMessageBytes.
+	maxErrorTypeBytes = 64
 
 	contentTypeJSON = "application/json"
 	userAgentPrefix = "jev-mcp/"
@@ -210,7 +215,7 @@ func (c *Client) Evaluate(ctx context.Context, req Request) (*Result, error) {
 func (c *Client) callProvider(ctx context.Context, p *Provider, req Request) (*Result, int, error) {
 	endpoint, err := p.Endpoint()
 	if err != nil {
-		return nil, 0, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, 0, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	call := req
 	if p.ModelID != nil {
@@ -259,7 +264,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	c.setHeaders(httpReq, p)
 
@@ -268,7 +273,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: err.Error()}
+		return nil, &APIError{Provider: p.Name, Sentinel: ErrTransport, Message: CleanText(err.Error())}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -281,7 +286,7 @@ func (c *Client) doRequest(ctx context.Context, endpoint string, p *Provider, bo
 			Provider:  p.Name,
 			Status:    resp.StatusCode,
 			Sentinel:  ErrTransport,
-			Message:   err.Error(),
+			Message:   CleanText(err.Error()),
 			RequestID: headerRequestID(resp.Header),
 		}
 	}
@@ -339,7 +344,7 @@ func decodeResponse(p *Provider, resp *http.Response, data []byte) (*Response, e
 			Provider:  p.Name,
 			Status:    resp.StatusCode,
 			Sentinel:  ErrMalformedResponse,
-			Message:   err.Error(),
+			Message:   CleanText(err.Error()),
 			RequestID: requestID(resp, data),
 		}
 	}
@@ -396,7 +401,8 @@ func apiErrorRetryAfter(err error) time.Duration {
 // the raw body.
 // TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
 // (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401); the
-// error_type is kept as a prefix. Every result goes through [CleanText].
+// error_type is kept as a prefix. Every result is cleaned as [CleanText]
+// cleans.
 func extractMessage(body []byte) string {
 	var env struct {
 		Error   json.RawMessage `json:"error"`
@@ -415,9 +421,10 @@ func extractMessage(body []byte) string {
 
 // fieldMessage reads an "error", "detail", or "message" field that may be an
 // object with a message or a bare string, and returns it cleaned. An object's
-// error_type, when it is a string that is not blank once cleaned, is prefixed
-// ("api_usage_error: Unknown model") so the provider's classification stays
-// visible. Any other shape, or a message that is empty once cleaned, yields "".
+// error_type, when it is a string of at most maxErrorTypeBytes that is not
+// blank once cleaned, is prefixed ("api_usage_error: Unknown model") so the
+// provider's classification stays visible. Any other shape, or a message that
+// is empty once cleaned, yields "".
 func fieldMessage(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -433,8 +440,8 @@ func fieldMessage(raw json.RawMessage) string {
 		}
 		var errType string
 		if json.Unmarshal(obj.ErrorType, &errType) == nil {
-			if t := CleanText(errType); t != "" {
-				return strings.TrimSpace(truncateMessage([]byte(t + ": " + msg)))
+			if t := CleanText(errType); t != "" && len(t) <= maxErrorTypeBytes {
+				return CleanText(t + ": " + msg)
 			}
 		}
 		return msg
@@ -454,9 +461,9 @@ func CleanText(s string) string {
 	return cleanBytes([]byte(s))
 }
 
-// cleanBytes implements [CleanText]. Leading whitespace and control
-// characters are dropped first, so padding cannot push the text out of the
-// cap. Then the text is cut to maxMessageBytes, each run of invalid UTF-8
+// cleanBytes implements [CleanText]. Leading whitespace and the characters it
+// replaces are dropped first, so padding made of them cannot push the text out
+// of the cap. Then the text is cut to maxMessageBytes, each run of invalid UTF-8
 // becomes one U+FFFD, and every control (Cc), bidirectional control (the
 // overrides, embeddings, isolates, and marks that reorder a line), line
 // separator (Zl), and paragraph separator (Zp) character becomes a space.
@@ -517,8 +524,8 @@ func requestID(resp *http.Response, body []byte) string {
 // by [CleanText]: net/http rejects ASCII control bytes in a header value but
 // passes bytes from 0x80 up, which may encode C1 controls or invalid UTF-8.
 func headerRequestID(h http.Header) string {
-	if id := h.Get("X-Typesafe-Request-Id"); id != "" {
-		return CleanText(id)
+	if id := CleanText(h.Get("X-Typesafe-Request-Id")); id != "" {
+		return id
 	}
 	return CleanText(h.Get("X-Request-ID"))
 }

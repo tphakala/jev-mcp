@@ -20,7 +20,7 @@ import (
 //
 // Each key is passed through [NormalizeAPIKey] before it is used, so a key
 // pasted with a trailing newline still works. A key that is set but blank, or
-// that holds a control character, is an error ([ErrBlankAPIKey] or
+// that holds an ASCII control character other than tab, is an error ([ErrBlankAPIKey] or
 // [ErrInvalidAPIKey], naming the variable) whenever that provider would be
 // used: it is a credential problem, reported before any request rather than
 // as a transport failure on every call. In auto mode a blank key still counts

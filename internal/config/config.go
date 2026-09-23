@@ -332,11 +332,11 @@ func resolveFallback(cfg *Config, getenv func(string) string) error {
 // tab net/http strips from a received header value (net/textproto reader.go
 // trim, Go 1.27.1), plus CR and LF, which end a header line and so cannot be
 // part of a value. A token pasted with a trailing space or newline therefore
-// still matches what a client can send. An
-// empty value stays empty, meaning no authentication. A value that is non-empty
-// but only those characters returns [ErrBlankHTTPToken] rather than an empty
-// token, so a configured token never turns into "no authentication", and one
-// that still holds a control character returns [ErrInvalidHTTPToken]. Neither
+// still matches what a client can send. An empty value stays empty, meaning
+// no authentication. A value that is non-empty but only those characters
+// returns [ErrBlankHTTPToken] rather than an empty token, so a configured token
+// never turns into "no authentication", and one that still holds an ASCII
+// control character other than tab returns [ErrInvalidHTTPToken]. Neither
 // error includes the value.
 func NormalizeHTTPToken(v string) (string, error) {
 	return normalizeSecret(v, ErrBlankHTTPToken, ErrInvalidHTTPToken)
@@ -345,8 +345,9 @@ func NormalizeHTTPToken(v string) (string, error) {
 // NormalizeAPIKey prepares a provider API key for use the same way as
 // [NormalizeHTTPToken]: surrounding spaces, tabs, and line breaks are trimmed;
 // an empty value stays empty (the key is unset); a value that is only those
-// characters returns [ErrBlankAPIKey]; and a value that still holds a control
-// character returns [ErrInvalidAPIKey]. Neither error includes the value.
+// characters returns [ErrBlankAPIKey]; and a value that still holds an ASCII
+// control character other than tab returns [ErrInvalidAPIKey]. Neither error
+// includes the value.
 func NormalizeAPIKey(v string) (string, error) {
 	return normalizeSecret(v, ErrBlankAPIKey, ErrInvalidAPIKey)
 }

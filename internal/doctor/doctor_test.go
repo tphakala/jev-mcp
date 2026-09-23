@@ -593,6 +593,22 @@ func TestRunInterruptedWithoutProbeExplainsTheExit(t *testing.T) {
 	}
 }
 
+// TestRunProbeOmitsAnIDThatCleansToNothing checks that an id made only of
+// control characters leaves no dangling "id=" on the PASS line.
+func TestRunProbeOmitsAnIDThatCleansToNothing(t *testing.T) {
+	t.Parallel()
+
+	res := &jev.Result{Latency: time.Millisecond}
+	res.Model = "jev-1.13.0"
+	res.ID = "\x1b"
+	var out strings.Builder
+	doctor.Run(t.Context(), &out, getenvFrom(map[string]string{config.EnvTypeSafeKey: "ts-key"}), true, factoryReturning(&fakeEvaluator{res: res}))
+
+	if got := out.String(); !strings.Contains(got, "[PASS] probe") || strings.Contains(got, "id=") {
+		t.Errorf("want a PASS line without id=\n%s", got)
+	}
+}
+
 // TestRunProbeCleansProviderValues checks that the model and id a provider
 // returns cannot carry a control sequence onto the PASS line.
 func TestRunProbeCleansProviderValues(t *testing.T) {

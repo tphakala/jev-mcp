@@ -68,7 +68,7 @@ type check struct {
 
 // Run performs the preflight checks and writes the report to out, reading the
 // environment through getenv (pass os.Getenv in production). When probe is true
-// it makes one live decision call per configured provider. newClient is
+// it makes one live decision call per selected provider. newClient is
 // injected for tests; pass nil for the real client. The probes run
 // concurrently and are reported in provider order. Run returns the process
 // exit code: 1 if any check failed or ctx was cancelled (an interrupted run
@@ -112,7 +112,7 @@ func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe b
 	// interrupted run never exits 1 with only PASS lines printed.
 	interrupted := ctx.Err() != nil
 	if interrupted {
-		checks = append(checks, check{statusSkip, "run", "interrupted before the checks finished"})
+		checks = append(checks, check{statusSkip, "run", "interrupted"})
 	}
 	code := report(out, checks)
 	if interrupted {
@@ -187,8 +187,9 @@ func effectiveBaseURL(override, def string) string {
 	return override
 }
 
-// secretState reports a secret as unset, set, blank (only whitespace), or
-// invalid (a control character left after trimming) without revealing it.
+// secretState reports a secret as unset, set, blank (only spaces, tabs, and
+// line breaks), or invalid (an ASCII control character other than tab left
+// after trimming) without revealing it.
 // normErr is the result of normalizing the secret.
 func secretState(secret string, normErr error) string {
 	switch {
@@ -299,8 +300,9 @@ func defaultModelCheck(model string) check {
 
 // httpTokenCheck reports whether the HTTP bearer token is set. It never fails,
 // since stdio mode needs no token; a token that HTTP serve mode refuses to
-// start with (blank, or holding a control character) is a warning. raw is the
-// configured value and normErr the result of normalizing it.
+// start with (blank, or holding an ASCII control character other than tab) is
+// a warning. raw is the configured value and normErr the result of
+// normalizing it.
 func httpTokenCheck(raw string, normErr error) check {
 	const name = "http token"
 	const refusal = "; HTTP serve mode would refuse to start unless -http-token is given"

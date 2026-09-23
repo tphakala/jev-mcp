@@ -510,6 +510,11 @@ func TestExtractMessage(t *testing.T) {
 		// Unicode line separators and bidi controls are replaced; joiners stay.
 		{"separators and bidi controls", `{"message":"a\u2028b\u202ec\u2066d\u2029e\u200ff"}`, "a b c d e f"},
 		{"zero-width joiners kept", `{"message":"` + joined + `"}`, joined},
+		{"long error_type is not a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes+1) + `","message":"Unknown model"}}`, "Unknown model"},
+		{"error_type at the limit is a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes) + `","message":"m"}}`, strings.Repeat("t", maxErrorTypeBytes) + ": m"},
+		// The back-off stops three bytes before the cap: one valid byte more
+		// would be lost if it went further.
+		{"back-off limit", strings.Repeat("x", maxMessageBytes-3) + strings.Repeat("\x80", 8), strings.Repeat("x", maxMessageBytes-3) + "\uFFFD"},
 		{"prefixed message cut at a space is trimmed", `{"detail":{"error_type":"t","message":"` + strings.Repeat("x", maxMessageBytes-4) + ` y"}}`, "t: " + strings.Repeat("x", maxMessageBytes-4)},
 		// Invalid bytes at the cut become U+FFFD instead of eating valid text.
 		{"raw body of continuation bytes at the cut", "ab" + strings.Repeat("\x80", 600), "ab\uFFFD"},
@@ -542,7 +547,7 @@ func TestCleanTextStaysWithinCap(t *testing.T) {
 // within the cap, valid UTF-8, no character CleanText promises to replace,
 // no surrounding whitespace, and stable when cleaned again.
 func FuzzCleanText(f *testing.F) {
-	for _, seed := range []string{"", "ok", "\x1b[2J", "\xff\xfe", "a\u2028b\u202ec", strings.Repeat("\u20ac", 300), strings.Repeat(" ", 600) + "x"} {
+	for _, seed := range []string{"", "ok", "quota exceeded for key q-1", "\x1b[2J", "\xff\xfe", "a\u2028b\u202ec", strings.Repeat("\u20ac", 300), strings.Repeat(" ", 600) + "x"} {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
@@ -562,6 +567,11 @@ func FuzzCleanText(f *testing.F) {
 		if again := CleanText(got); again != got {
 			t.Fatalf("not stable: %q -> %q", got, again)
 		}
+		// Safe text is left alone: printable ASCII with no surrounding space
+		// that fits the cap comes back unchanged.
+		if len(in) <= maxMessageBytes && strings.TrimSpace(in) == in && !strings.ContainsFunc(in, func(r rune) bool { return r < ' ' || r > '~' }) && got != in {
+			t.Fatalf("printable text changed: %q -> %q", in, got)
+		}
 	})
 }
 
@@ -580,8 +590,41 @@ func TestRequestIDsAreCleaned(t *testing.T) {
 	if got := headerRequestID(ts); got != "ts- id" {
 		t.Errorf("headerRequestID(TypeSafe) = %q, want the bidi control replaced", got)
 	}
+	both := http.Header{}
+	both.Set("X-Typesafe-Request-Id", "\u0085")
+	both.Set("X-Request-ID", "req-2")
+	if got := headerRequestID(both); got != "req-2" {
+		t.Errorf("headerRequestID = %q, want the second header when the first cleans to nothing", got)
+	}
 	if got := bodyRequestID([]byte(`{"id":"req\u001b]0;x\u0007-9"}`)); got != "req ]0;x -9" {
 		t.Errorf("bodyRequestID = %q, want the controls replaced", got)
+	}
+}
+
+// errTransport is a RoundTripper that fails every request with a fixed error.
+type errTransport struct{ err error }
+
+func (e errTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
+
+// TestTransportErrorMessageIsCleaned checks that transport error text, which
+// can carry server-controlled bytes (a certificate's names in a hostname
+// mismatch, for example), is cleaned like a provider message.
+func TestTransportErrorMessageIsCleaned(t *testing.T) {
+	t.Parallel()
+
+	c := newTestClient(t, "https://example.invalid",
+		WithHTTPClient(&http.Client{Transport: errTransport{errors.New("x509: certificate is valid for \x1b[2Jevil\u202e, not example.invalid")}}),
+		WithMaxRetries(0))
+	_, err := c.Evaluate(t.Context(), sampleRequest())
+	apiErr, ok := errors.AsType[*APIError](err)
+	if !ok {
+		t.Fatalf("err = %v, want an *APIError", err)
+	}
+	if strings.ContainsFunc(apiErr.Message, isUnsafe) {
+		t.Errorf("Message %q holds a character CleanText replaces", apiErr.Message)
+	}
+	if !strings.Contains(apiErr.Message, "evil") {
+		t.Errorf("Message %q lost the text", apiErr.Message)
 	}
 }
 
