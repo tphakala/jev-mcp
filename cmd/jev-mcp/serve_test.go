@@ -355,6 +355,7 @@ func TestServeCommandHTTPToken(t *testing.T) {
 		{name: "flag token overrides env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer env-tok", want401: true, wantAuth: "auth=true"},
 		{name: "flag token accepted", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, authz: "Bearer flag-tok", wantAuth: "auth=true"},
 		{name: "empty flag disables auth", opts: serveOptions{httpTokenSet: true}, wantAuth: "auth=false"},
+		{name: "flag token is trimmed", opts: serveOptions{httpToken: " flag-tok\n", httpTokenSet: true}, authz: "Bearer flag-tok", wantAuth: "auth=true"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -389,6 +390,23 @@ func TestServeCommandHTTPToken(t *testing.T) {
 				t.Error("the HTTP token reached the log")
 			}
 		})
+	}
+}
+
+// TestServeCommandBlankFlagToken checks that an -http-token of only whitespace
+// is refused rather than trimmed to empty, which would serve unauthenticated.
+func TestServeCommandBlankFlagToken(t *testing.T) {
+	t.Parallel()
+
+	opts := serveOptions{httpAddr: "127.0.0.1:1", httpToken: " \t", httpTokenSet: true}
+	env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-key"})
+	var stderr syncBuffer
+	code := serveCommand(t.Context(), opts, env, noLookup(t), io.NopCloser(strings.NewReader("")), io.Discard, &stderr)
+	if code != exitError {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitError, stderr.String())
+	}
+	if got := stderr.String(); !strings.Contains(got, "-http-token") || !strings.Contains(got, "whitespace") {
+		t.Errorf("stderr %q does not explain the blank -http-token", got)
 	}
 }
 

@@ -389,8 +389,11 @@ func apiErrorRetryAfter(err error) time.Duration {
 }
 
 // extractMessage pulls a human message from an error body, trying
-// {"error":{"message"}}, {"error":"..."}, {"detail"}, and {"message"} in turn,
-// then falling back to the first maxMessageBytes of the raw body.
+// {"error":{"message"}}, {"error":"..."}, {"detail":{"message"}},
+// {"detail":"..."}, and {"message"} in turn, then falling back to the raw body.
+// TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
+// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
+// result is capped at maxMessageBytes on every path.
 func extractMessage(body []byte) string {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -398,25 +401,21 @@ func extractMessage(body []byte) string {
 	}
 	var env struct {
 		Error   json.RawMessage `json:"error"`
-		Detail  string          `json:"detail"`
+		Detail  json.RawMessage `json:"detail"`
 		Message string          `json:"message"`
 	}
 	if err := json.Unmarshal(trimmed, &env); err == nil {
-		if m := messageFromError(env.Error); m != "" {
-			return m
-		}
-		if env.Detail != "" {
-			return env.Detail
-		}
-		if env.Message != "" {
-			return env.Message
+		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), env.Message} {
+			if m != "" {
+				return truncateMessage([]byte(m))
+			}
 		}
 	}
 	return truncateMessage(trimmed)
 }
 
-// messageFromError reads an "error" field that may be an object with a message
-// or a bare string.
+// messageFromError reads an "error" or "detail" field that may be an object
+// with a message or a bare string.
 func messageFromError(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

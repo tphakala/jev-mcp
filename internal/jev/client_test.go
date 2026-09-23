@@ -458,6 +458,35 @@ func TestTruncateMessage(t *testing.T) {
 	}
 }
 
+func TestExtractMessage(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("x", maxMessageBytes+100)
+	cases := []struct {
+		name, body, want string
+	}{
+		{"empty", "  ", ""},
+		{"error object", `{"error":{"code":401,"message":"bad key"}}`, "bad key"},
+		{"error string", `{"error":"bad key"}`, "bad key"},
+		// The TypeSafe envelope as it came back live for an unknown model.
+		{"typesafe detail object", `{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-nope"}}`, "Unknown model: jev-nope"},
+		{"detail string", `{"detail":"nope"}`, "nope"},
+		{"message", `{"message":"slow down"}`, "slow down"},
+		{"error wins over detail", `{"error":"first","detail":"second"}`, "first"},
+		{"detail array falls back to body", `{"detail":[{"msg":"field required"}]}`, `{"detail":[{"msg":"field required"}]}`},
+		{"not json", "upstream timeout", "upstream timeout"},
+		{"long field is capped", `{"detail":{"message":"` + long + `"}}`, long[:maxMessageBytes]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := extractMessage([]byte(tc.body)); got != tc.want {
+				t.Errorf("extractMessage(%q) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEvaluateValidationErrorSkipsNetwork(t *testing.T) {
 	t.Parallel()
 
