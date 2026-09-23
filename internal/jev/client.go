@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	jevmcp "github.com/tphakala/jev-mcp"
@@ -394,8 +395,9 @@ func apiErrorRetryAfter(err error) time.Duration {
 // with a message, skipping one that is empty or only whitespace, then falls
 // back to the raw body.
 // TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
-// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
-// result is capped at maxMessageBytes on every path.
+// (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401); the
+// error_type is kept as a prefix. The result is sanitized by [cleanMessage] on
+// every path.
 func extractMessage(body []byte) string {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -407,25 +409,31 @@ func extractMessage(body []byte) string {
 		Message json.RawMessage `json:"message"`
 	}
 	if err := json.Unmarshal(trimmed, &env); err == nil {
-		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), messageFromError(env.Message)} {
+		for _, m := range []string{fieldMessage(env.Error), fieldMessage(env.Detail), fieldMessage(env.Message)} {
 			if strings.TrimSpace(m) != "" {
-				return truncateMessage([]byte(m))
+				return cleanMessage([]byte(m))
 			}
 		}
 	}
-	return truncateMessage(trimmed)
+	return cleanMessage(trimmed)
 }
 
-// messageFromError reads an "error", "detail", or "message" field that may be
-// an object with a message or a bare string. Any other shape yields "".
-func messageFromError(raw json.RawMessage) string {
+// fieldMessage reads an "error", "detail", or "message" field that may be an
+// object with a message or a bare string. An object's non-empty error_type is
+// prefixed ("api_usage_error: Unknown model") so the provider's classification
+// stays visible. Any other shape yields "".
+func fieldMessage(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
 	var obj struct {
-		Message string `json:"message"`
+		Message   string `json:"message"`
+		ErrorType string `json:"error_type"`
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil && obj.Message != "" {
+		if t := strings.TrimSpace(obj.ErrorType); t != "" {
+			return t + ": " + obj.Message
+		}
 		return obj.Message
 	}
 	var s string
@@ -433,6 +441,25 @@ func messageFromError(raw json.RawMessage) string {
 		return s
 	}
 	return ""
+}
+
+// cleanMessage makes a provider message safe to show: at most maxMessageBytes,
+// valid UTF-8 (an invalid byte sequence becomes U+FFFD), and free of control
+// characters, each of which becomes a space, so a terminal escape or a line
+// break in a provider message cannot reach a tool error or doctor's output as
+// a control sequence. The body is cut before it is sanitized, so a large body
+// is never scanned in full.
+func cleanMessage(body []byte) string {
+	s := strings.ToValidUTF8(truncateMessage(body), "\uFFFD")
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	// U+FFFD is three bytes, so replacing invalid bytes can grow the string past
+	// the cap; cut again on a rune boundary.
+	return strings.TrimSpace(truncateMessage([]byte(s)))
 }
 
 // truncateMessage returns the first maxMessageBytes of body as a string. It

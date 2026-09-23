@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
 	"os"
 
@@ -22,9 +21,7 @@ func doctorCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
-	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
-		fs.Usage()
+	if rejectPositional(fs, stderr) {
 		return exitUsage
 	}
 	return doctor.Run(ctx, stdout, os.Getenv, probe, nil)

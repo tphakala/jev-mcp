@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -469,7 +470,9 @@ func TestExtractMessage(t *testing.T) {
 		{"error object", `{"error":{"code":401,"message":"bad key"}}`, "bad key"},
 		{"error string", `{"error":"bad key"}`, "bad key"},
 		// The TypeSafe envelope as it came back live for an unknown model.
-		{"typesafe detail object", `{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-nope"}}`, "Unknown model: jev-nope"},
+		{"typesafe detail object", `{"detail":{"error_type":"api_usage_error","message":"Unknown model: jev-nope"}}`, "api_usage_error: Unknown model: jev-nope"},
+		{"blank error_type is not a prefix", `{"detail":{"error_type":" ","message":"m"}}`, "m"},
+		{"error_type without a message is skipped", `{"detail":{"error_type":"x"},"message":"m"}`, "m"},
 		{"detail string", `{"detail":"nope"}`, "nope"},
 		{"message", `{"message":"slow down"}`, "slow down"},
 		{"error wins over detail", `{"error":"first","detail":"second"}`, "first"},
@@ -483,6 +486,16 @@ func TestExtractMessage(t *testing.T) {
 		{"detail array falls back to body", `{"detail":[{"msg":"field required"}]}`, `{"detail":[{"msg":"field required"}]}`},
 		{"not json", "upstream timeout", "upstream timeout"},
 		{"long field is capped", `{"detail":{"message":"` + long + `"}}`, long[:maxMessageBytes]},
+		// The raw-body path at and just over the cap.
+		{"raw body at exactly the cap is kept whole", long[:maxMessageBytes], long[:maxMessageBytes]},
+		{"raw body one over the cap is cut", long[:maxMessageBytes+1], long[:maxMessageBytes]},
+		// JSON-escaped control characters, such as a terminal escape, are decoded
+		// by json.Unmarshal and must not survive into the message.
+		{"escaped terminal escape in a field", `{"message":"\u001b[31mred\u001b[0m"}`, "[31mred [0m"},
+		{"line breaks in a field", `{"message":"one\ntwo\r\nthree"}`, "one two  three"},
+		{"C1 control in a field", `{"message":"a\u0085b"}`, "a b"},
+		{"raw body control characters", "bad\x1b[2Jgateway\x00", "bad [2Jgateway"},
+		{"raw body invalid UTF-8 run becomes one U+FFFD", "bad \xff\xfe gateway", "bad \uFFFD gateway"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -491,6 +504,28 @@ func TestExtractMessage(t *testing.T) {
 				t.Errorf("extractMessage(%q) = %q, want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCleanMessageStaysWithinCap checks that replacing invalid bytes with the
+// three-byte U+FFFD cannot push a message past the cap, and that the result is
+// valid UTF-8 without control characters.
+func TestCleanMessageStaysWithinCap(t *testing.T) {
+	t.Parallel()
+
+	body := bytes.Repeat([]byte{0xff, 0x1b}, maxMessageBytes)
+	got := cleanMessage(body)
+	if len(got) > maxMessageBytes {
+		t.Errorf("len = %d, want <= %d", len(got), maxMessageBytes)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("result is not valid UTF-8: %q", got)
+	}
+	if strings.ContainsFunc(got, unicode.IsControl) {
+		t.Errorf("result holds a control character: %q", got)
+	}
+	if !strings.HasPrefix(got, "\uFFFD") {
+		t.Errorf("want the invalid bytes shown as U+FFFD, got %q", got)
 	}
 }
 

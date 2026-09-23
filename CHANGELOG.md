@@ -15,5 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - README: configuration reference, the `jev_evaluate` input and output, and MCP client setup for Claude Code, a generic `mcpServers` entry, and the container image.
 - Provider error messages are read from TypeSafe's `{"detail":{"message"}}` error body, as well as `error` and `message`, and are length-capped.
 - The HTTP bearer token (`JEV_MCP_HTTP_TOKEN` or `-http-token`) is trimmed of surrounding spaces, tabs, and line breaks, so a token copied with a trailing newline still authenticates; HTTP mode refuses to start with a token that is only those characters.
+- `TYPESAFE_API_KEY` and `OPENROUTER_API_KEY` are trimmed the same way. A key that is only whitespace, or that holds a control character, stops the server at startup with an error naming the variable, instead of failing every call as a retried transport error.
+- HTTP mode refuses a bearer token that holds a control character other than tab, and logs a warning when it runs without a token.
+- Provider error messages keep TypeSafe's `error_type` (for example `api_usage_error: Unknown model`), and control characters and invalid UTF-8 are replaced before the message reaches a tool error or `doctor`.
+- `doctor` shows a credential as `blank` or `invalid` when it is set but unusable, reports a bad API key even when that provider is not selected, runs the `-probe` calls concurrently, and reports a probe cut short by Ctrl-C as interrupted rather than failed.
 
 [Unreleased]: https://github.com/tphakala/jev-mcp/compare/v0.1.0...HEAD

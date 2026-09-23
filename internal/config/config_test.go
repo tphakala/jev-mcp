@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -374,6 +375,33 @@ func TestResolveParseErrorAttributesDefault(t *testing.T) {
 	}
 }
 
+// TestResolveParseErrorAttributesDefaultPerSetting pins the default source for
+// each numeric or boolean setting when its own value fails to parse.
+func TestResolveParseErrorAttributesDefaultPerSetting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		env, source string
+		wantErr     error
+	}{
+		{config.EnvTimeout, config.SourceTimeout, config.ErrInvalidTimeout},
+		{config.EnvMaxRetries, config.SourceMaxRetries, config.ErrInvalidMaxRetries},
+		{config.EnvFallback, config.SourceFallback, config.ErrInvalidFallback},
+	}
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := config.Resolve(getenvFrom(map[string]string{tt.env: "nope"}))
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if got := cfg.Sources[tt.source]; got != config.SourceDefault {
+				t.Errorf("Sources[%s] = %q, want %q", tt.source, got, config.SourceDefault)
+			}
+		})
+	}
+}
+
 // TestResolveInvalidProviderIsRejectedBySelect confirms an invalid provider mode
 // is preserved on the Config (not reset to auto), so a caller that ignores the
 // Resolve error still cannot silently select a provider: Select rejects it too.
@@ -419,6 +447,37 @@ func TestResolveRedactsLongInvalidValue(t *testing.T) {
 	}
 }
 
+// TestResolveRedactionBoundary pins the echo limit: a 32-byte invalid value is
+// shown quoted, a 33-byte one is redacted.
+func TestResolveRedactionBoundary(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		n          int
+		wantQuoted bool
+	}{
+		{32, true},
+		{33, false},
+	}
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.n), func(t *testing.T) {
+			t.Parallel()
+			v := strings.Repeat("x", tt.n)
+			_, err := config.Resolve(getenvFrom(map[string]string{config.EnvTimeout: v}))
+			if !errors.Is(err, config.ErrInvalidTimeout) {
+				t.Fatalf("err = %v, want ErrInvalidTimeout", err)
+			}
+			quoted := strings.Contains(err.Error(), strconv.Quote(v))
+			if quoted != tt.wantQuoted {
+				t.Errorf("%d-byte value quoted = %v, want %v: %q", tt.n, quoted, tt.wantQuoted, err.Error())
+			}
+			if !tt.wantQuoted && !strings.Contains(err.Error(), "<redacted, 33 bytes>") {
+				t.Errorf("error should state the redacted length: %q", err.Error())
+			}
+		})
+	}
+}
+
 func TestResolveNeverRecordsSecretsInSources(t *testing.T) {
 	t.Parallel()
 
@@ -451,38 +510,71 @@ func TestResolveNeverRecordsSecretsInSources(t *testing.T) {
 	}
 }
 
-func TestNormalizeHTTPToken(t *testing.T) {
+// TestNormalizeSecrets runs the same table against the HTTP token and the API
+// key normalizers, which share one trim and one header-safety rule but report
+// through their own sentinels.
+func TestNormalizeSecrets(t *testing.T) {
 	t.Parallel()
 
+	normalizers := []struct {
+		name       string
+		fn         func(string) (string, error)
+		errBlank   error
+		errInvalid error
+	}{
+		{"http token", config.NormalizeHTTPToken, config.ErrBlankHTTPToken, config.ErrInvalidHTTPToken},
+		{"api key", config.NormalizeAPIKey, config.ErrBlankAPIKey, config.ErrInvalidAPIKey},
+	}
+	const (
+		ok = iota
+		blank
+		invalid
+	)
 	tests := []struct {
 		name, in, want string
-		wantErr        bool
+		outcome        int
 	}{
 		{name: "empty stays empty", in: "", want: ""},
 		{name: "clean", in: "tok", want: "tok"},
 		{name: "trailing newline", in: "tok\n", want: "tok"},
 		{name: "surrounding spaces and tabs", in: " \ttok \t", want: "tok"},
 		{name: "inner space kept", in: "to k", want: "to k"},
+		{name: "inner tab kept", in: "to\tk", want: "to\tk"},
 		// net/http does not trim a non-breaking space from a header value, so
 		// neither does the normalizer.
 		{name: "non-breaking space kept", in: "\u00a0tok\u00a0", want: "\u00a0tok\u00a0"},
-		{name: "only non-breaking space is a token", in: "\u00a0", want: "\u00a0"},
-		{name: "only spaces", in: "  ", wantErr: true},
-		{name: "only line breaks", in: "\r\n", wantErr: true},
+		{name: "only non-breaking space is a value", in: "\u00a0", want: "\u00a0"},
+		// U+0085 is a Unicode control character, but its UTF-8 bytes are both
+		// at or above 0x80, which a header value may carry.
+		{name: "non-ASCII control kept", in: "tok\u0085", want: "tok\u0085"},
+		{name: "only spaces", in: "  ", outcome: blank},
+		{name: "only line breaks", in: "\r\n", outcome: blank},
+		{name: "inner newline", in: "to\nk", outcome: invalid},
+		{name: "vertical tab", in: "tok\v", outcome: invalid},
+		{name: "NUL", in: "tok\x00", outcome: invalid},
+		{name: "DEL", in: "tok\x7f", outcome: invalid},
+		{name: "escape", in: "\x1b[31mtok", outcome: invalid},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got, err := config.NormalizeHTTPToken(tt.in)
-			if tt.wantErr {
-				if !errors.Is(err, config.ErrBlankHTTPToken) {
-					t.Errorf("NormalizeHTTPToken(%q) error = %v, want ErrBlankHTTPToken", tt.in, err)
+	for _, n := range normalizers {
+		for _, tt := range tests {
+			t.Run(n.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				got, err := n.fn(tt.in)
+				switch tt.outcome {
+				case blank:
+					if !errors.Is(err, n.errBlank) || got != "" {
+						t.Errorf("(%q) = %q, %v; want \"\", %v", tt.in, got, err, n.errBlank)
+					}
+				case invalid:
+					if !errors.Is(err, n.errInvalid) || got != "" {
+						t.Errorf("(%q) = %q, %v; want \"\", %v", tt.in, got, err, n.errInvalid)
+					}
+				default:
+					if err != nil || got != tt.want {
+						t.Errorf("(%q) = %q, %v; want %q, nil", tt.in, got, err, tt.want)
+					}
 				}
-				return
-			}
-			if err != nil || got != tt.want {
-				t.Errorf("NormalizeHTTPToken(%q) = %q, %v; want %q, nil", tt.in, got, err, tt.want)
-			}
-		})
+			})
+		}
 	}
 }

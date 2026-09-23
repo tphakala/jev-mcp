@@ -116,12 +116,22 @@ func parseFlags(args []string, stderr io.Writer) (bool, serveOptions, error) {
 	if err := fs.Parse(args); err != nil {
 		return false, serveOptions{}, errUsage
 	}
-	if fs.NArg() != 0 {
-		_, _ = fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
-		fs.Usage()
+	if rejectPositional(fs, stderr) {
 		return false, serveOptions{}, errUsage
 	}
 	return showVersion, serveOpts(), nil
+}
+
+// rejectPositional reports whether fs was left with a positional argument
+// after parsing, which no command accepts. When it was, the argument and the
+// usage have been written to stderr.
+func rejectPositional(fs *flag.FlagSet, stderr io.Writer) bool {
+	if fs.NArg() == 0 {
+		return false
+	}
+	_, _ = fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
+	fs.Usage()
+	return true
 }
 
 // versionString reports Version plus the VCS revision the toolchain embedded

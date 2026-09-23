@@ -80,9 +80,10 @@ func withStop(ctx context.Context, d Deps) Deps {
 // the tool schemas are built once rather than per request.
 //
 // The handler is wrapped with cross-origin protection: a cross-origin browser
-// POST (signalled by Sec-Fetch-Site or a mismatched Origin) is rejected with
-// 403, while a request with neither header, as non-browser MCP clients send,
-// passes through.
+// request (signalled by Sec-Fetch-Site or a mismatched Origin) with any method
+// other than GET, HEAD, or OPTIONS is rejected with 403, while a request with
+// neither header, as non-browser MCP clients send, passes through
+// (net/http/csrf.go, Go 1.27.1).
 //
 // When token is non-empty, a bearer-token check runs in front of that: a
 // request without a matching Authorization: Bearer <token> header gets 401. An

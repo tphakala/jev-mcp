@@ -9,11 +9,13 @@ package doctor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -43,13 +45,16 @@ type Evaluator interface {
 // -probe; a nil factory means the real per-provider client.
 type ClientFactory func(p jev.Provider) (Evaluator, error)
 
-// status is a check outcome. FAIL sets a non-zero exit; WARN does not.
+// status is a check outcome. FAIL sets a non-zero exit; WARN does not. SKIP
+// marks a probe that did not run to completion because the run was
+// interrupted; Run exits non-zero for an interrupted run regardless.
 type status string
 
 const (
 	statusPass status = "PASS"
 	statusWarn status = "WARN"
 	statusFail status = "FAIL"
+	statusSkip status = "SKIP"
 )
 
 // check is one reported line.
@@ -62,13 +67,17 @@ type check struct {
 // Run performs the preflight checks and writes the report to out, reading the
 // environment through getenv (pass os.Getenv in production). When probe is true
 // it makes one live decision call per configured provider. newClient is
-// injected for tests; pass nil for the real client. Run returns the process
-// exit code: 1 if any check failed, 0 otherwise (a warning does not fail). A
-// usage error (a bad flag) is the caller's concern, not Run's.
+// injected for tests; pass nil for the real client. The probes run
+// concurrently and are reported in provider order. Run returns the process
+// exit code: 1 if any check failed or ctx was cancelled (an interrupted probe
+// is reported as SKIP, not as a failure of the provider), 0 otherwise (a
+// warning does not fail). A usage error (a bad flag) is the caller's concern,
+// not Run's.
 func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe bool, newClient ClientFactory) int {
 	cfg, cfgErr := config.Resolve(getenv)
+	token, tokenErr := config.NormalizeHTTPToken(cfg.HTTPToken)
 
-	writeSettings(out, &cfg)
+	writeSettings(out, &cfg, tokenErr)
 
 	var checks []check
 	if cfgErr != nil {
@@ -85,21 +94,37 @@ func Run(ctx context.Context, out io.Writer, getenv func(string) string, probe b
 	}
 
 	checks = append(checks,
-		credentialFormatCheck(&cfg),
+		credentialFormatCheck(&cfg, token),
 		defaultModelCheck(cfg.DefaultModel),
-		httpTokenCheck(&cfg),
+		httpTokenCheck(cfg.HTTPToken, tokenErr),
 	)
 
 	if probe && cfgErr == nil && selErr == nil {
 		if newClient == nil {
 			newClient = defaultClientFactory()
 		}
-		for i := range providers {
-			checks = append(checks, probeCheck(ctx, &providers[i], cfg.DefaultModel, newClient))
-		}
+		checks = append(checks, probeChecks(ctx, providers, cfg.DefaultModel, newClient)...)
 	}
 
-	return report(out, checks)
+	code := report(out, checks)
+	if ctx.Err() != nil {
+		return 1
+	}
+	return code
+}
+
+// probeChecks probes every provider concurrently and returns the checks in
+// provider order.
+func probeChecks(ctx context.Context, providers []jev.Provider, model string, newClient ClientFactory) []check {
+	checks := make([]check, len(providers))
+	var wg sync.WaitGroup
+	for i := range providers {
+		wg.Go(func() {
+			checks[i] = probeCheck(ctx, &providers[i], model, newClient)
+		})
+	}
+	wg.Wait()
+	return checks
 }
 
 // report prints each check and returns the exit code: 1 if any check failed.
@@ -118,9 +143,10 @@ func report(out io.Writer, checks []check) int {
 	return 0
 }
 
-// writeSettings prints the non-secret settings with their sources and the
-// set/unset state of each credential. It never prints a secret value.
-func writeSettings(out io.Writer, cfg *config.Config) {
+// writeSettings prints the non-secret settings with their sources and the state
+// of each credential. It never prints a secret value. tokenErr is the result of
+// normalizing the HTTP token.
+func writeSettings(out io.Writer, cfg *config.Config, tokenErr error) {
 	_, _ = fmt.Fprintln(out, "settings:")
 	line := func(name, value, source string) {
 		_, _ = fmt.Fprintf(out, "  %s=%s (%s)\n", name, value, source)
@@ -132,9 +158,15 @@ func writeSettings(out io.Writer, cfg *config.Config) {
 	line("timeout", cfg.Timeout.String(), cfg.Sources[config.SourceTimeout])
 	line("max_retries", strconv.Itoa(cfg.MaxRetries), cfg.Sources[config.SourceMaxRetries])
 	line("fallback", strconv.FormatBool(cfg.Fallback), cfg.Sources[config.SourceFallback])
-	_, _ = fmt.Fprintf(out, "  typesafe_key=%s\n", setState(cfg.TypeSafeKey))
-	_, _ = fmt.Fprintf(out, "  openrouter_key=%s\n", setState(cfg.OpenRouterKey))
-	_, _ = fmt.Fprintf(out, "  http_token=%s\n", setState(cfg.HTTPToken))
+	_, _ = fmt.Fprintf(out, "  typesafe_key=%s\n", secretState(cfg.TypeSafeKey, apiKeyErr(cfg.TypeSafeKey)))
+	_, _ = fmt.Fprintf(out, "  openrouter_key=%s\n", secretState(cfg.OpenRouterKey, apiKeyErr(cfg.OpenRouterKey)))
+	_, _ = fmt.Fprintf(out, "  http_token=%s\n", secretState(cfg.HTTPToken, tokenErr))
+}
+
+// apiKeyErr returns the error from normalizing an API key, or nil.
+func apiKeyErr(key string) error {
+	_, err := config.NormalizeAPIKey(key)
+	return err
 }
 
 // effectiveBaseURL renders the base URL in effect: the override when set, else
@@ -147,12 +179,20 @@ func effectiveBaseURL(override, def string) string {
 	return override
 }
 
-// setState reports a secret as set or unset without revealing it.
-func setState(secret string) string {
-	if secret == "" {
+// secretState reports a secret as unset, set, blank (only whitespace), or
+// invalid (a control character left after trimming) without revealing it.
+// normErr is the result of normalizing the secret.
+func secretState(secret string, normErr error) string {
+	switch {
+	case secret == "":
 		return "unset"
+	case errors.Is(normErr, config.ErrBlankAPIKey), errors.Is(normErr, config.ErrBlankHTTPToken):
+		return "blank"
+	case normErr != nil:
+		return "invalid"
+	default:
+		return "set"
 	}
-	return "set"
 }
 
 // describeProviders renders the ordered provider list with each endpoint and the
@@ -181,22 +221,30 @@ type namedSecret struct {
 	value string
 }
 
-// credentialFormatCheck warns when a set credential has surrounding whitespace, an
-// embedded quote, or a control character: the usual copy-paste damage. It
-// covers the HTTP bearer token as well as the two API keys; the token is
-// checked after [config.NormalizeHTTPToken], since serve trims it, and a blank
-// token is left to [httpTokenCheck]. It never prints a value.
-func credentialFormatCheck(cfg *config.Config) check {
-	token, err := config.NormalizeHTTPToken(cfg.HTTPToken)
-	if err != nil {
-		token = ""
-	}
-	secrets := []namedSecret{
+// credentialFormatCheck warns about paste damage in the set credentials, judged
+// as they are used: the API keys after [config.NormalizeAPIKey] and the HTTP
+// token after [config.NormalizeHTTPToken], so a trailing newline that is
+// trimmed anyway is not reported. A key that normalization rejects is reported
+// here too, since a key the provider selection does not use is not reported
+// anywhere else; a rejected token is left to [httpTokenCheck]. token is the
+// normalized token ("" when it was rejected). It never prints a value.
+func credentialFormatCheck(cfg *config.Config, token string) check {
+	var warnings []string
+	secrets := []namedSecret{{config.EnvHTTPToken, token}}
+	for _, k := range []namedSecret{
 		{config.EnvTypeSafeKey, cfg.TypeSafeKey},
 		{config.EnvOpenRouterKey, cfg.OpenRouterKey},
-		{config.EnvHTTPToken, token},
+	} {
+		key, err := config.NormalizeAPIKey(k.value)
+		switch {
+		case errors.Is(err, config.ErrBlankAPIKey):
+			warnings = append(warnings, k.name+" is set but only whitespace")
+		case err != nil:
+			warnings = append(warnings, k.name+" has a control character that cannot be sent in a header")
+		default:
+			secrets = append(secrets, namedSecret{k.name, key})
+		}
 	}
-	var warnings []string
 	for _, s := range secrets {
 		if w := tokenFormatWarning(s.name, s.value); w != "" {
 			warnings = append(warnings, w)
@@ -208,15 +256,18 @@ func credentialFormatCheck(cfg *config.Config) check {
 	return check{statusPass, "credential format", "no formatting problems in set credentials"}
 }
 
-// tokenFormatWarning returns a description of the format problems in value, or
-// "" when value is unset or clean. It never includes the value.
+// tokenFormatWarning returns a description of the format problems in a
+// normalized credential value, or "" when value is unset or clean. The
+// normalizers trim only ASCII whitespace, so any whitespace still at an end
+// (a non-breaking space, for example) is sent as part of the value. It never
+// includes the value.
 func tokenFormatWarning(name, value string) string {
 	if value == "" {
 		return ""
 	}
 	var issues []string
-	if strings.TrimSpace(value) != value {
-		issues = append(issues, "surrounding whitespace")
+	if strings.TrimFunc(value, unicode.IsSpace) != value {
+		issues = append(issues, "surrounding whitespace that is not trimmed")
 	}
 	if strings.ContainsAny(value, `"'`) {
 		issues = append(issues, "an embedded quote")
@@ -239,14 +290,19 @@ func defaultModelCheck(model string) check {
 }
 
 // httpTokenCheck reports whether the HTTP bearer token is set. It never fails,
-// since stdio mode needs no token; a blank token, which HTTP serve mode refuses
-// to start with, is a warning.
-func httpTokenCheck(cfg *config.Config) check {
+// since stdio mode needs no token; a token that HTTP serve mode refuses to
+// start with (blank, or holding a control character) is a warning. raw is the
+// configured value and normErr the result of normalizing it.
+func httpTokenCheck(raw string, normErr error) check {
 	const name = "http token"
-	if _, err := config.NormalizeHTTPToken(cfg.HTTPToken); err != nil {
-		return check{statusWarn, name, config.EnvHTTPToken + " is set but only whitespace; HTTP serve mode would refuse to start unless -http-token is given"}
+	const refusal = "; HTTP serve mode would refuse to start unless -http-token is given"
+	if errors.Is(normErr, config.ErrBlankHTTPToken) {
+		return check{statusWarn, name, config.EnvHTTPToken + " is set but only whitespace" + refusal}
 	}
-	if cfg.HTTPToken == "" {
+	if normErr != nil {
+		return check{statusWarn, name, config.EnvHTTPToken + " has a control character that cannot be sent in a header" + refusal}
+	}
+	if raw == "" {
 		return check{statusPass, name, "unset (HTTP serve mode would be unauthenticated)"}
 	}
 	return check{statusPass, name, "set"}
@@ -263,6 +319,9 @@ func probeCheck(ctx context.Context, p *jev.Provider, model string, newClient Cl
 	}
 	res, err := client.Evaluate(ctx, probeRequest(model))
 	if err != nil {
+		if ctx.Err() != nil {
+			return check{statusSkip, name, "interrupted before the probe finished"}
+		}
 		return check{statusFail, name, probeErrorDetail(err)}
 	}
 	detail := fmt.Sprintf("model=%s latency=%s tokens=%d/%d",

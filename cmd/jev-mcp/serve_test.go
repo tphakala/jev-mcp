@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -390,6 +391,12 @@ func TestServeCommandHTTPToken(t *testing.T) {
 			if !strings.Contains(stderr.String(), tt.wantAuth) {
 				t.Errorf("startup log %q does not contain %q", stderr.String(), tt.wantAuth)
 			}
+			// An unauthenticated server is also reported at warn level, so it
+			// shows at -log-level warn; an authenticated one is not.
+			gotWarn := strings.Contains(stderr.String(), "level=WARN msg="+strconv.Quote(logMsgHTTPNoAuth))
+			if wantWarn := tt.wantAuth == "auth=false"; gotWarn != wantWarn {
+				t.Errorf("no-auth warning present = %v, want %v (stderr: %s)", gotWarn, wantWarn, stderr.String())
+			}
 			if got := stderr.String(); strings.Contains(got, "env-tok") || strings.Contains(got, "flag-tok") {
 				t.Error("the HTTP token reached the log")
 			}
@@ -414,6 +421,8 @@ func TestServeCommandBlankToken(t *testing.T) {
 	}{
 		{name: "blank flag refused", opts: serveOptions{httpToken: " \t", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrBlankHTTPToken.Error()},
 		{name: "blank env refused", envToken: " \n", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrBlankHTTPToken.Error()},
+		{name: "control character in flag refused", opts: serveOptions{httpToken: "tok\x7f", httpTokenSet: true}, envToken: "env-tok", wantCode: exitError, wantStderr: "-http-token: " + config.ErrInvalidHTTPToken.Error()},
+		{name: "control character in env refused", envToken: "to\x0bk", wantCode: exitError, wantStderr: config.EnvHTTPToken + ": " + config.ErrInvalidHTTPToken.Error()},
 		{name: "flag overrides blank env", opts: serveOptions{httpToken: "flag-tok", httpTokenSet: true}, envToken: " \n", wantCode: exitOK, wantStderr: "auth=true"},
 		{name: "stdio ignores blank env", opts: serveOptions{httpAddr: "-"}, envToken: " \n", wantCode: exitOK, wantStderr: logMsgServeStdio},
 	}
@@ -563,5 +572,28 @@ func TestParseFlagsServeOptions(t *testing.T) {
 				t.Fatalf("parseFlags(%q) = %+v, want %+v", tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestServeCommandRefusesBadAPIKey checks that a key that cannot be sent in a
+// header stops serve at startup with a credential error naming the variable,
+// rather than failing every call as a transport error.
+func TestServeCommandRefusesBadAPIKey(t *testing.T) {
+	t.Parallel()
+
+	env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-\x00-key"})
+	var stderr syncBuffer
+	code := serveCommand(t.Context(), serveOptions{}, env, noLookup(t), io.NopCloser(strings.NewReader("")), io.Discard, &stderr)
+	got := stderr.String()
+	if code != exitError {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitError, got)
+	}
+	for _, want := range []string{config.ErrInvalidAPIKey.Error(), config.EnvTypeSafeKey, "jev-mcp doctor"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stderr %q does not contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "-key") {
+		t.Errorf("stderr %q echoes the key", got)
 	}
 }
