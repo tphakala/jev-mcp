@@ -511,6 +511,8 @@ func TestExtractMessage(t *testing.T) {
 		{"separators and bidi controls", `{"message":"a\u2028b\u202ec\u2066d\u2029e\u200ff"}`, "a b c d e f"},
 		{"zero-width joiners kept", `{"message":"` + joined + `"}`, joined},
 		{"long error_type is not a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes+1) + `","message":"Unknown model"}}`, "Unknown model"},
+		// The limit applies to the cleaned error_type, not the raw one.
+		{"padded error_type is measured once cleaned", `{"detail":{"error_type":"` + strings.Repeat(" ", 100) + `t","message":"m"}}`, "t: m"},
 		{"error_type at the limit is a prefix", `{"detail":{"error_type":"` + strings.Repeat("t", maxErrorTypeBytes) + `","message":"m"}}`, strings.Repeat("t", maxErrorTypeBytes) + ": m"},
 		// The back-off stops three bytes before the cap: one valid byte more
 		// would be lost if it went further.

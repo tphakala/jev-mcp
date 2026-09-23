@@ -404,10 +404,10 @@ func TestServeCommandHTTPToken(t *testing.T) {
 	}
 }
 
-// TestServeCommandBlankToken checks where a token of only whitespace is
-// refused: only when HTTP mode would use it. A blank environment token does not
-// stop stdio mode, which never reads it, or HTTP mode when -http-token
-// overrides it. The context is cancelled up front so a server that does start
+// TestServeCommandBlankToken checks where a token of only spaces, tabs, and
+// line breaks, or one holding a control character, is refused: only when HTTP
+// mode would use it. A blank environment token does not stop stdio mode, which
+// never reads it, or HTTP mode when -http-token overrides it. The context is cancelled up front so a server that does start
 // returns at once instead of serving.
 func TestServeCommandBlankToken(t *testing.T) {
 	t.Parallel()

@@ -55,7 +55,8 @@ var (
 
 // APIError is a non-success HTTP response from a provider. It wraps a sentinel
 // (matched with errors.Is) and carries the provider name, status, a best-effort
-// message from the body, the provider's request id, and any Retry-After the
+// message (from the body, or from the Go error for a failure below HTTP),
+// cleaned by [CleanText], the provider's request id, and any Retry-After the
 // server asked for. A transport failure before any response has a zero Status.
 type APIError struct {
 	Provider   string

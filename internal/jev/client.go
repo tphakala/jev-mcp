@@ -36,7 +36,7 @@ const (
 	defaultCallBudget = 30 * time.Second
 
 	// maxMessageBytes bounds the best-effort error message taken from a body,
-	// and every other provider-supplied text [CleanText] returns.
+	// and everything [CleanText] returns.
 	maxMessageBytes = 512
 
 	// maxErrorTypeBytes bounds an error_type kept as a message prefix, so a
@@ -421,8 +421,8 @@ func extractMessage(body []byte) string {
 
 // fieldMessage reads an "error", "detail", or "message" field that may be an
 // object with a message or a bare string, and returns it cleaned. An object's
-// error_type, when it is a string of at most maxErrorTypeBytes that is not
-// blank once cleaned, is prefixed ("api_usage_error: Unknown model") so the
+// error_type, when it is a string that, once cleaned, is non-empty and at most
+// maxErrorTypeBytes, is prefixed ("api_usage_error: Unknown model") so the
 // provider's classification stays visible. Any other shape, or a message that
 // is empty once cleaned, yields "".
 func fieldMessage(raw json.RawMessage) string {
@@ -462,8 +462,8 @@ func CleanText(s string) string {
 }
 
 // cleanBytes implements [CleanText]. Leading whitespace and the characters it
-// replaces are dropped first, so padding made of them cannot push the text out
-// of the cap. Then the text is cut to maxMessageBytes, each run of invalid UTF-8
+// turns into spaces are dropped first, so padding made of them cannot push the
+// text out of the cap. Then the text is cut to maxMessageBytes, each run of invalid UTF-8
 // becomes one U+FFFD, and every control (Cc), bidirectional control (the
 // overrides, embeddings, isolates, and marks that reorder a line), line
 // separator (Zl), and paragraph separator (Zp) character becomes a space.
