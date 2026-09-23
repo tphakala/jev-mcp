@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -390,7 +391,8 @@ func apiErrorRetryAfter(err error) time.Duration {
 
 // extractMessage pulls a human message from an error body from the "error",
 // "detail", and "message" fields in turn, each either a string or an object
-// with a message, then falls back to the raw body.
+// with a message, skipping one that is empty or only whitespace, then falls
+// back to the raw body.
 // TypeSafe reports errors as {"detail":{"error_type":..,"message":..}}
 // (MEASURED against api.typesafe.ai on 2026-09-23 for a 400 and a 401). The
 // result is capped at maxMessageBytes on every path.
@@ -406,7 +408,7 @@ func extractMessage(body []byte) string {
 	}
 	if err := json.Unmarshal(trimmed, &env); err == nil {
 		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), messageFromError(env.Message)} {
-			if m != "" {
+			if strings.TrimSpace(m) != "" {
 				return truncateMessage([]byte(m))
 			}
 		}

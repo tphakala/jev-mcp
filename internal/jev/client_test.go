@@ -474,6 +474,8 @@ func TestExtractMessage(t *testing.T) {
 		{"message", `{"message":"slow down"}`, "slow down"},
 		{"error wins over detail", `{"error":"first","detail":"second"}`, "first"},
 		{"detail wins over message", `{"detail":"first","message":"second"}`, "first"},
+		{"only whitespace fields fall back to body", `{"error":"   "}`, `{"error":"   "}`},
+		{"whitespace error does not hide detail", `{"error":" \t","detail":{"message":"real reason"}}`, "real reason"},
 		// A field of an unexpected shape is skipped, not allowed to hide the others.
 		{"mistyped message does not hide detail", `{"detail":"d","message":123}`, "d"},
 		{"message object", `{"message":{"message":"inner"}}`, "inner"},
