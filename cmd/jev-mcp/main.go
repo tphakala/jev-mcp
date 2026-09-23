@@ -35,8 +35,8 @@ const (
 )
 
 func main() {
-	// stdout is the JSON-RPC stream in stdio mode; keep the standard logger off
-	// it so a stray log line from a dependency cannot corrupt the protocol.
+	// stdout is the JSON-RPC stream in stdio mode. The standard logger already
+	// writes to stderr; this reasserts it in case a dependency redirected it.
 	log.SetOutput(os.Stderr)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
@@ -91,6 +91,14 @@ func writeLine(stdout, stderr io.Writer, line string) int {
 	return exitOK
 }
 
+// usageHeader is printed above the flag list by -h and on a usage error.
+const usageHeader = `Usage:
+  jev-mcp [flags]           serve MCP over stdio, or over HTTP with -http
+  jev-mcp doctor [-probe]   check the configuration and providers
+
+Flags:
+`
+
 // parseFlags parses args and reports whether -version was requested, plus the
 // serve options. On a usage error the flag package has already printed the
 // message and usage to stderr, so parseFlags returns errUsage and the caller
@@ -101,6 +109,10 @@ func parseFlags(args []string, stderr io.Writer) (bool, serveOptions, error) {
 	fs.SetOutput(stderr)
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	serveOpts := registerServeFlags(fs)
+	fs.Usage = func() {
+		_, _ = fmt.Fprint(stderr, usageHeader)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
 		return false, serveOptions{}, errUsage
 	}

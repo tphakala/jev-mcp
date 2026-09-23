@@ -194,7 +194,8 @@ func evaluateInputSchema() *jsonschema.Schema {
 // float64 and re-sorts object keys, so an integer above 2^53 in state would
 // reach Jev rounded. The handler therefore builds the request from the
 // arguments as the client sent them (CallToolParamsRaw.Arguments), after the
-// SDK has validated them against the input schema.
+// SDK has validated them against the input schema. The schema declares no
+// defaults, so the raw arguments carry everything the validated input does.
 type rawQuestion struct {
 	Name         string          `json:"name"`
 	Type         string          `json:"type"`

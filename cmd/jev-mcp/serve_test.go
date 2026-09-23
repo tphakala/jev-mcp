@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -123,49 +126,182 @@ func TestServeCommandStartupErrors(t *testing.T) {
 	}
 }
 
+// stdioSession is a client connected to serveCommand over pipes.
+type stdioSession struct {
+	cs     *mcp.ClientSession
+	done   chan int
+	stderr *syncBuffer
+}
+
+// startStdio runs serveCommand over pipes with env and connects a client. A
+// connect failure reports the server's exit code and stderr, which carry the
+// reason when serveCommand fails at startup.
+func startStdio(t *testing.T, opts serveOptions, env map[string]string) *stdioSession {
+	t.Helper()
+	serverIn, clientOut := io.Pipe()
+	clientIn, serverOut := io.Pipe()
+	s := &stdioSession{done: make(chan int, 1), stderr: &syncBuffer{}}
+	go func() {
+		s.done <- serveCommand(t.Context(), opts, envMap(env), noLookup(t), serverIn, serverOut, s.stderr)
+		_ = serverOut.Close()
+	}()
+	client := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil)
+	cs, err := client.Connect(t.Context(), &mcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
+	if err != nil {
+		select {
+		case code := <-s.done:
+			t.Fatalf("connect: %v (serveCommand exit %d, stderr: %s)", err, code, s.stderr.String())
+		case <-time.After(2 * time.Second):
+			t.Fatalf("connect: %v (stderr: %s)", err, s.stderr.String())
+		}
+	}
+	s.cs = cs
+	t.Cleanup(func() { _ = cs.Close() })
+	return s
+}
+
+// hangUp closes the client and returns serveCommand's exit code.
+func (s *stdioSession) hangUp(t *testing.T) int {
+	t.Helper()
+	_ = s.cs.Close()
+	select {
+	case code := <-s.done:
+		return code
+	case <-time.After(10 * time.Second):
+		t.Fatalf("serveCommand did not return after the client hung up (stderr: %s)", s.stderr.String())
+		return -1
+	}
+}
+
 // TestServeCommandStdio drives a full stdio session through serveCommand:
 // initialize and list tools over pipes, then hang up. The protocol stream is
 // the only thing on stdout; the startup log line goes to stderr.
 func TestServeCommandStdio(t *testing.T) {
 	t.Parallel()
 
-	serverIn, clientOut := io.Pipe()
-	clientIn, serverOut := io.Pipe()
-	var stderr syncBuffer
-	env := envMap(map[string]string{config.EnvTypeSafeKey: "ts-key"})
-	done := make(chan int, 1)
-	go func() {
-		done <- serveCommand(t.Context(), serveOptions{logLevel: slog.LevelInfo}, env, noLookup(t), serverIn, serverOut, &stderr)
-		_ = serverOut.Close()
-	}()
-
-	client := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil)
-	cs, err := client.Connect(t.Context(), &mcp.IOTransport{Reader: clientIn, Writer: clientOut}, nil)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	tools, err := cs.ListTools(t.Context(), nil)
+	s := startStdio(t, serveOptions{logLevel: slog.LevelInfo}, map[string]string{config.EnvTypeSafeKey: "ts-key"})
+	tools, err := s.cs.ListTools(t.Context(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
 	if len(tools.Tools) != 1 || tools.Tools[0].Name != "jev_evaluate" {
 		t.Fatalf("tools = %v, want jev_evaluate", tools.Tools)
 	}
-	_ = cs.Close()
-
-	select {
-	case code := <-done:
-		if code != exitOK {
-			t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("serveCommand did not return after the client hung up")
+	if code := s.hangUp(t); code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, s.stderr.String())
 	}
-	if got := stderr.String(); !strings.Contains(got, logMsgServeStdio) {
+	got := s.stderr.String()
+	if !strings.Contains(got, logMsgServeStdio) {
 		t.Errorf("stderr %q does not contain the startup log line", got)
 	}
-	if strings.Contains(stderr.String(), "ts-key") {
+	if strings.Contains(got, logMsgAuthFlagUnused) {
+		t.Errorf("stderr %q warns about -http-token although it was not given", got)
+	}
+	if strings.Contains(got, "ts-key") {
 		t.Error("the API key reached the log")
+	}
+}
+
+// TestServeCommandWarnsUnusedToken checks that -http-token without -http is
+// reported rather than silently ignored.
+func TestServeCommandWarnsUnusedToken(t *testing.T) {
+	t.Parallel()
+
+	opts := serveOptions{httpToken: "tok", httpTokenSet: true, logLevel: slog.LevelInfo}
+	s := startStdio(t, opts, map[string]string{config.EnvTypeSafeKey: "ts-key"})
+	if code := s.hangUp(t); code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, s.stderr.String())
+	}
+	if got := s.stderr.String(); !strings.Contains(got, logMsgAuthFlagUnused) {
+		t.Errorf("stderr %q does not warn that -http-token is unused", got)
+	}
+}
+
+// TestServeCommandWiresConfig drives a tool call through serveCommand against
+// a fake provider, to pin that the resolved configuration reaches the client:
+// the base URL, the default model, the retry count, and the call budget.
+func TestServeCommandWiresConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		env      map[string]string
+		handler  func(w http.ResponseWriter, r *http.Request)
+		wantHits int
+		maxTime  time.Duration
+	}{
+		{
+			// One 500 and no retries: the call fails after a single attempt.
+			// The default of two retries would retry and succeed.
+			name: "max retries and default model",
+			env:  map[string]string{config.EnvMaxRetries: "0", config.EnvDefaultModel: "jev-wired"},
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			wantHits: 1,
+			maxTime:  5 * time.Second,
+		},
+		{
+			// A provider that never answers: the call fails when the 300ms
+			// budget runs out, well before the 10s per-request timeout the
+			// default 30s budget would leave in charge.
+			name: "call budget",
+			env:  map[string]string{config.EnvTimeout: "300ms", config.EnvMaxRetries: "0", config.EnvDefaultModel: "jev-wired"},
+			handler: func(_ http.ResponseWriter, r *http.Request) {
+				<-r.Context().Done()
+			},
+			wantHits: 1,
+			maxTime:  3 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var (
+				mu     sync.Mutex
+				models []string
+			)
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Model string `json:"model"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				mu.Lock()
+				models = append(models, body.Model)
+				mu.Unlock()
+				tt.handler(w, r)
+			}))
+			t.Cleanup(provider.Close)
+
+			env := map[string]string{config.EnvTypeSafeKey: "ts-key", config.EnvTypeSafeBaseURL: provider.URL}
+			maps.Copy(env, tt.env)
+			s := startStdio(t, serveOptions{}, env)
+			start := time.Now()
+			res, err := s.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: "jev_evaluate", Arguments: map[string]any{
+				"state":     "s",
+				"questions": []any{map[string]any{"name": "q", "type": "noul", "instructions": "q"}},
+			}})
+			took := time.Since(start)
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("call succeeded, want a provider error")
+			}
+			if took > tt.maxTime {
+				t.Errorf("call took %v, want under %v", took, tt.maxTime)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(models) != tt.wantHits {
+				t.Errorf("provider saw %d requests, want %d", len(models), tt.wantHits)
+			}
+			for _, m := range models {
+				if m != "jev-wired" {
+					t.Errorf("request model = %q, want the configured default jev-wired", m)
+				}
+			}
+		})
 	}
 }
 

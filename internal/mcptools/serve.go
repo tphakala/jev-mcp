@@ -131,7 +131,7 @@ func unauthorized(w http.ResponseWriter) {
 //
 // Every request runs under ctx, so cancelling it ends open event streams and
 // in-flight evaluations; the server then shuts down, waiting up to
-// shutdownTimeout for handlers to return.
+// shutdownTimeout for handlers to return before closing their connections.
 func ServeHTTP(ctx context.Context, d Deps, addr, token string) error {
 	logger := d.Logger
 	if logger == nil {
@@ -155,7 +155,10 @@ func ServeHTTP(ctx context.Context, d Deps, addr, token string) error {
 		shutCtx, c := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 		defer c()
 		if err := srv.Shutdown(shutCtx); err != nil {
+			// Handlers outlived the drain; close their connections rather than
+			// return with them still running.
 			logger.Warn(logMsgShutdown, slog.String("error", err.Error()))
+			_ = srv.Close()
 		}
 	}()
 	err := srv.ListenAndServe()

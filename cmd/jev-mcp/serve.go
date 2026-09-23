@@ -16,9 +16,14 @@ import (
 
 // Log messages are constants; variable data goes in attributes.
 const (
-	logMsgServeStdio = "serving over stdio"
-	logMsgServeHTTP  = "serving Streamable HTTP"
+	logMsgServeStdio     = "serving over stdio"
+	logMsgServeHTTP      = "serving Streamable HTTP"
+	logMsgAuthFlagUnused = "-http-token has no effect without -http"
 )
+
+// flagHTTPToken is the -http-token flag name, shared by its definition and
+// the check that tells an explicit empty value from an omitted flag.
+const flagHTTPToken = "http-token"
 
 // serveOptions are the parsed serve flags.
 type serveOptions struct {
@@ -57,6 +62,9 @@ func serveCommand(ctx context.Context, opts serveOptions, getenv func(string) st
 	deps := mcptools.Deps{Client: client, DefaultModel: cfg.DefaultModel, Logger: logger}
 
 	if opts.httpAddr == "" {
+		if opts.httpTokenSet {
+			logger.Warn(logMsgAuthFlagUnused)
+		}
 		logger.Info(logMsgServeStdio, slog.Int("providers", len(providers)))
 		if err := mcptools.ServeStdio(ctx, deps, stdin, stdout); err != nil && !isShutdown(err) {
 			_, _ = fmt.Fprintln(stderr, "error: stdio serve:", err)
@@ -106,7 +114,7 @@ func newLogger(w io.Writer, level slog.Level, asJSON bool) *slog.Logger {
 func registerServeFlags(fs *flag.FlagSet) func() serveOptions {
 	var opts serveOptions
 	fs.StringVar(&opts.httpAddr, "http", "", "serve Streamable HTTP on this loopback address (e.g. 127.0.0.1:8765) instead of stdio")
-	fs.StringVar(&opts.httpToken, "http-token", "", "require Authorization: Bearer <token> in HTTP mode (overrides JEV_MCP_HTTP_TOKEN; an empty value forces unauthenticated)")
+	fs.StringVar(&opts.httpToken, flagHTTPToken, "", "require Authorization: Bearer <token> in HTTP mode (overrides JEV_MCP_HTTP_TOKEN; an empty value forces unauthenticated)")
 	fs.TextVar(&opts.logLevel, "log-level", slog.LevelInfo, "log level: debug, info, warn, or error")
 	fs.BoolVar(&opts.logJSON, "log-json", false, "write logs as JSON instead of text")
 	return func() serveOptions {
@@ -114,7 +122,7 @@ func registerServeFlags(fs *flag.FlagSet) func() serveOptions {
 		// flag.Visit reports only the flags present on the command line, which
 		// is how "-http-token ''" (force unauthenticated) differs from omission.
 		fs.Visit(func(f *flag.Flag) {
-			if f.Name == "http-token" {
+			if f.Name == flagHTTPToken {
 				opts.httpTokenSet = true
 			}
 		})
@@ -129,10 +137,11 @@ func registerServeFlags(fs *flag.FlagSet) func() serveOptions {
 // address must be loopback, so a hosts-file remap of "localhost" to a routable
 // address is caught.
 //
-// net.Listen resolves a host name again at bind time, so a DNS or hosts-file
-// change between this check and the bind could still bind elsewhere. Making
-// that change needs root, which defeats any such check anyway; this guards
-// against an accidental bind, not a privileged attacker.
+// net.Listen resolves a host name again at bind time, so the answer can change
+// between this check and the bind: a hosts-file edit needs root, but a name
+// served by DNS is under the DNS server's control. The check guards against
+// an accidental non-loopback bind; for a guarantee, pass a loopback IP
+// literal, which is never resolved.
 func checkLoopbackAddrResolved(addr string, lookup func(string) ([]string, error)) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
