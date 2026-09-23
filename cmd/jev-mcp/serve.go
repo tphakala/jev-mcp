@@ -77,12 +77,17 @@ func serveCommand(ctx context.Context, opts serveOptions, getenv func(string) st
 		_, _ = fmt.Fprintln(stderr, "error:", err)
 		return exitError
 	}
-	token := cfg.HTTPToken
+	// The token is normalized here, where HTTP mode uses it, rather than in
+	// config.Resolve: stdio never reads it, and a flag overrides the
+	// environment even when the environment's value is blank.
+	rawToken, tokenSource := cfg.HTTPToken, config.EnvHTTPToken
 	if opts.httpTokenSet {
-		if token, err = config.NormalizeHTTPToken(opts.httpToken); err != nil {
-			_, _ = fmt.Fprintf(stderr, "error: -%s: %v\n", flagHTTPToken, err)
-			return exitError
-		}
+		rawToken, tokenSource = opts.httpToken, "-"+flagHTTPToken
+	}
+	token, err := config.NormalizeHTTPToken(rawToken)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %s: %v\n", tokenSource, err)
+		return exitError
 	}
 	logger.Info(logMsgServeHTTP,
 		slog.String("addr", opts.httpAddr),
@@ -119,7 +124,7 @@ func newLogger(w io.Writer, level slog.Level, asJSON bool) *slog.Logger {
 func registerServeFlags(fs *flag.FlagSet) func() serveOptions {
 	var opts serveOptions
 	fs.StringVar(&opts.httpAddr, "http", "", "serve Streamable HTTP on this loopback address (e.g. 127.0.0.1:8765) instead of stdio")
-	fs.StringVar(&opts.httpToken, flagHTTPToken, "", "require Authorization: Bearer <token> in HTTP mode (overrides JEV_MCP_HTTP_TOKEN; surrounding whitespace is trimmed; an empty value forces unauthenticated)")
+	fs.StringVar(&opts.httpToken, flagHTTPToken, "", "require Authorization: Bearer <token> in HTTP mode (overrides JEV_MCP_HTTP_TOKEN; surrounding spaces, tabs, and line breaks are trimmed; an empty value forces unauthenticated)")
 	fs.TextVar(&opts.logLevel, "log-level", slog.LevelInfo, "log level: debug, info, warn, or error")
 	fs.BoolVar(&opts.logJSON, "log-json", false, "write logs as JSON instead of text")
 	return func() serveOptions {

@@ -402,10 +402,10 @@ func extractMessage(body []byte) string {
 	var env struct {
 		Error   json.RawMessage `json:"error"`
 		Detail  json.RawMessage `json:"detail"`
-		Message string          `json:"message"`
+		Message json.RawMessage `json:"message"`
 	}
 	if err := json.Unmarshal(trimmed, &env); err == nil {
-		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), env.Message} {
+		for _, m := range []string{messageFromError(env.Error), messageFromError(env.Detail), messageFromError(env.Message)} {
 			if m != "" {
 				return truncateMessage([]byte(m))
 			}
@@ -414,8 +414,8 @@ func extractMessage(body []byte) string {
 	return truncateMessage(trimmed)
 }
 
-// messageFromError reads an "error" or "detail" field that may be an object
-// with a message or a bare string.
+// messageFromError reads an "error", "detail", or "message" field that may be
+// an object with a message or a bare string. Any other shape yields "".
 func messageFromError(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""

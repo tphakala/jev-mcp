@@ -183,13 +183,18 @@ type namedSecret struct {
 
 // credentialFormatCheck warns when a set credential has surrounding whitespace, an
 // embedded quote, or a control character: the usual copy-paste damage. It
-// covers the HTTP bearer token as well as the two API keys. It never prints a
-// value.
+// covers the HTTP bearer token as well as the two API keys; the token is
+// checked after [config.NormalizeHTTPToken], since serve trims it, and a blank
+// token is left to [httpTokenCheck]. It never prints a value.
 func credentialFormatCheck(cfg *config.Config) check {
+	token, err := config.NormalizeHTTPToken(cfg.HTTPToken)
+	if err != nil {
+		token = ""
+	}
 	secrets := []namedSecret{
 		{config.EnvTypeSafeKey, cfg.TypeSafeKey},
 		{config.EnvOpenRouterKey, cfg.OpenRouterKey},
-		{config.EnvHTTPToken, cfg.HTTPToken},
+		{config.EnvHTTPToken, token},
 	}
 	var warnings []string
 	for _, s := range secrets {
@@ -233,13 +238,18 @@ func defaultModelCheck(model string) check {
 	return check{statusWarn, "default model", fmt.Sprintf("%q does not look like a Jev model id (expected e.g. jev-latest)", model)}
 }
 
-// httpTokenCheck reports whether the HTTP bearer token is set. It is
-// informational: stdio mode needs no token.
+// httpTokenCheck reports whether the HTTP bearer token is set. It never fails,
+// since stdio mode needs no token; a blank token, which HTTP serve mode refuses
+// to start with, is a warning.
 func httpTokenCheck(cfg *config.Config) check {
-	if cfg.HTTPToken == "" {
-		return check{statusPass, "http token", "unset (HTTP serve mode would be unauthenticated)"}
+	const name = "http token"
+	if _, err := config.NormalizeHTTPToken(cfg.HTTPToken); err != nil {
+		return check{statusWarn, name, config.EnvHTTPToken + " is set but only whitespace; HTTP serve mode would refuse to start"}
 	}
-	return check{statusPass, "http token", "set"}
+	if cfg.HTTPToken == "" {
+		return check{statusPass, name, "unset (HTTP serve mode would be unauthenticated)"}
+	}
+	return check{statusPass, name, "set"}
 }
 
 // probeCheck makes one live noul call against p and reports the outcome. A

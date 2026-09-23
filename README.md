@@ -48,10 +48,10 @@ Any MCP client that launches stdio servers works the same way; in the usual `mcp
 }
 ```
 
-With the container image instead of a local binary, keep stdin open with `-i`:
+With the container image instead of a local binary, keep stdin open with `-i` (images are tagged with the release version):
 
 ```
-docker run -i --rm -e TYPESAFE_API_KEY ghcr.io/tphakala/jev-mcp
+docker run -i --rm -e TYPESAFE_API_KEY ghcr.io/tphakala/jev-mcp:0.1.0
 ```
 
 ## Usage
@@ -68,13 +68,13 @@ Serve flags:
 | Flag | Meaning |
 | --- | --- |
 | `-http addr` | Serve Streamable HTTP on `addr` instead of stdio. The host must be loopback (`127.0.0.1`, `::1`, or a name that resolves only to loopback); anything else is refused. |
-| `-http-token token` | Require `Authorization: Bearer <token>` in HTTP mode. Overrides `JEV_MCP_HTTP_TOKEN`; an explicit empty value forces unauthenticated. |
+| `-http-token token` | Require `Authorization: Bearer <token>` in HTTP mode. Overrides `JEV_MCP_HTTP_TOKEN`; an explicit empty value forces unauthenticated. Trimmed and checked like the variable. |
 | `-log-level level` | `debug`, `info` (default), `warn`, or `error`. |
 | `-log-json` | Write logs as JSON instead of text. |
 
 Logs go to stderr; in stdio mode stdout carries only the MCP stream.
 
-In HTTP mode point the client at the listen address, for example `http://127.0.0.1:8765/`. Cross-origin browser requests are rejected. Because the bind is loopback only, a container can serve HTTP only with `--network host`; stdio is the supported container mode.
+In HTTP mode point the client at the listen address, for example `http://127.0.0.1:8765/`. Cross-origin browser POST requests are rejected. Because the bind is loopback only, a container can serve HTTP only with `--network host`; stdio is the supported container mode.
 
 ## Configuration
 
@@ -91,9 +91,9 @@ Everything is read from the environment. `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`
 | `JEV_MCP_MAX_RETRIES` | `2` | Retries per provider after the first attempt. |
 | `JEV_MCP_TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | TypeSafe base URL. `TYPESAFE_BASE_URL` is read when this is unset. |
 | `JEV_MCP_OPENROUTER_BASE_URL` | `https://openrouter.ai/api` | OpenRouter base URL. |
-| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Surrounding whitespace is trimmed; a value of only whitespace is an error. |
+| `JEV_MCP_HTTP_TOKEN` | | Bearer token for HTTP mode. Leading and trailing spaces, tabs, and line breaks are trimmed; HTTP mode refuses to start when nothing else is left. Stdio mode ignores it. |
 
-At least one API key is required to serve. Rate limits (429), overload (503, 529), other server errors, and transport failures are retried with jittered exponential backoff, honouring `Retry-After`. In `auto` mode with both keys, those failures and a rejected key move on to the fallback provider; a request the provider rejects as invalid does not, since it would fail there too.
+At least one API key is required to serve. Rate limits (429), overload (503, 529), other server errors, request timeouts (408), and transport failures are retried with jittered exponential backoff, honouring `Retry-After` and `Retry-After-Ms` up to a 20 second wait. In `auto` mode with both keys, those failures and a rejected key move on to the fallback provider; a request the provider rejects as invalid does not, since it would fail there too.
 
 ## The `jev_evaluate` tool
 
@@ -102,7 +102,7 @@ One tool, `jev_evaluate`, decides one or more questions over a shared state in a
 | Input | Meaning |
 | --- | --- |
 | `state` | What to decide over: a string, or a JSON object or array. Text only, at most 1 MiB encoded. |
-| `questions` | 1 to 64 questions, each `{name, type, instructions, criteria}`. Names must be unique. |
+| `questions` | 1 to 64 questions, each `{name, type, instructions, criteria}`. Names must be unique, at most 128 bytes, and free of control characters. `instructions` is the question to decide: usually a string, or a non-empty object or array. |
 | `model` | Optional Jev model id, such as `jev-latest` or `jev-1.13.0`. |
 | `detail` | `summary` (default) or `full`; controls the text result only. |
 
@@ -110,7 +110,7 @@ Question types:
 
 - `choice` picks one option. `criteria` is an object of 2 to 255 option names to descriptions; a description may be a string, an object, or `null`.
 - `score` places the state on an ordered scale. `criteria` is an array of 2 to 10 level descriptions, lowest first; a level may be a string or an object.
-- `noul` answers a yes/no proposition. `criteria` is optional. The answer is the probability that the proposition is true.
+- `noul` answers a yes/no proposition. `criteria` is optional: an object with `true` and `false` descriptions. The answer is the probability that the proposition is true.
 
 Example arguments:
 
@@ -133,7 +133,7 @@ The default text result is a compact summary, answers in question order:
 {"answers":[{"name":"route","choice":"billing","confidence":1},{"name":"urgency","score":1.27,"confidence":0.52},{"name":"refund","noul":0.98}]}
 ```
 
-The structured result always carries the full output: per answer the `type`, the decision, `confidence`, `probabilities`, and for a score the `legend`, plus `provider`, `model`, token `usage`, `latency_ms`, and `attempts`. With `detail` set to `full`, the text result carries the same full output, for clients that show the model only the text.
+The structured result always carries the full output: per answer the `type` and the decision, for a choice or score also `confidence` and `probabilities`, and for a score the `legend`; an answer this server cannot read comes back verbatim under `raw`. Each call also reports `provider`, `model`, token `usage` (with `cost` when the provider reports it), `latency_ms`, and `attempts`. With `detail` set to `full`, the text result carries the same full output, for clients that show the model only the text.
 
 State and instructions are sent to the provider's API, so do not put secrets in them.
 

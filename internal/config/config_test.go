@@ -203,12 +203,14 @@ func TestResolveValues(t *testing.T) {
 			mutate: func(w *wantConfig) { w.tsKey, w.httpToken = "ts-key", "http-bearer" },
 		},
 		{
-			name: "http token is trimmed",
+			// Resolve keeps the token verbatim; the serve and doctor code that
+			// use it normalize it.
+			name: "http token is kept verbatim",
 			env: map[string]string{
 				config.EnvTypeSafeKey: "ts-key",
 				config.EnvHTTPToken:   " http-bearer\r\n",
 			},
-			mutate: func(w *wantConfig) { w.tsKey, w.httpToken = "ts-key", "http-bearer" },
+			mutate: func(w *wantConfig) { w.tsKey, w.httpToken = "ts-key", " http-bearer\r\n" },
 		},
 	}
 
@@ -449,24 +451,6 @@ func TestResolveNeverRecordsSecretsInSources(t *testing.T) {
 	}
 }
 
-// TestResolveBlankHTTPToken checks that a token of only whitespace is an error
-// naming the variable, not a silent switch to unauthenticated, and that the
-// raw value stays on the Config so a caller ignoring the error fails closed.
-func TestResolveBlankHTTPToken(t *testing.T) {
-	t.Parallel()
-
-	cfg, err := config.Resolve(getenvFrom(map[string]string{config.EnvHTTPToken: " \t\n"}))
-	if !errors.Is(err, config.ErrBlankHTTPToken) {
-		t.Fatalf("Resolve error = %v, want wrapping ErrBlankHTTPToken", err)
-	}
-	if !strings.Contains(err.Error(), config.EnvHTTPToken) {
-		t.Errorf("error %q does not name %s", err, config.EnvHTTPToken)
-	}
-	if cfg.HTTPToken != " \t\n" {
-		t.Errorf("HTTPToken = %q, want the raw value kept", cfg.HTTPToken)
-	}
-}
-
 func TestNormalizeHTTPToken(t *testing.T) {
 	t.Parallel()
 
@@ -479,7 +463,12 @@ func TestNormalizeHTTPToken(t *testing.T) {
 		{name: "trailing newline", in: "tok\n", want: "tok"},
 		{name: "surrounding spaces and tabs", in: " \ttok \t", want: "tok"},
 		{name: "inner space kept", in: "to k", want: "to k"},
-		{name: "only whitespace", in: "  ", wantErr: true},
+		// net/http does not trim a non-breaking space from a header value, so
+		// neither does the normalizer.
+		{name: "non-breaking space kept", in: "\u00a0tok\u00a0", want: "\u00a0tok\u00a0"},
+		{name: "only non-breaking space is a token", in: "\u00a0", want: "\u00a0"},
+		{name: "only spaces", in: "  ", wantErr: true},
+		{name: "only line breaks", in: "\r\n", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

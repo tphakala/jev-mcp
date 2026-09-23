@@ -473,6 +473,11 @@ func TestExtractMessage(t *testing.T) {
 		{"detail string", `{"detail":"nope"}`, "nope"},
 		{"message", `{"message":"slow down"}`, "slow down"},
 		{"error wins over detail", `{"error":"first","detail":"second"}`, "first"},
+		{"detail wins over message", `{"detail":"first","message":"second"}`, "first"},
+		// A field of an unexpected shape is skipped, not allowed to hide the others.
+		{"mistyped message does not hide detail", `{"detail":"d","message":123}`, "d"},
+		{"message object", `{"message":{"message":"inner"}}`, "inner"},
+		{"exactly the cap is kept whole", `{"message":"` + long[:maxMessageBytes] + `"}`, long[:maxMessageBytes]},
 		{"detail array falls back to body", `{"detail":[{"msg":"field required"}]}`, `{"detail":[{"msg":"field required"}]}`},
 		{"not json", "upstream timeout", "upstream timeout"},
 		{"long field is capped", `{"detail":{"message":"` + long + `"}}`, long[:maxMessageBytes]},
